@@ -250,8 +250,10 @@ const shutdownWorker = (
 
 // --- Instance creation ---
 
+import type { ToolDescriptorForSandbox } from "./Sandbox"
+
 const createSandboxInstance = (
-  options: { callId: CallId; depth: number },
+  options: { callId: CallId; depth: number; tools?: ReadonlyArray<ToolDescriptorForSandbox> },
   bridgeHandler: BridgeHandler["Type"],
   config: SandboxConfig["Type"]
 ) =>
@@ -356,7 +358,10 @@ const createSandboxInstance = (
       callId: options.callId,
       depth: options.depth,
       sandboxMode: config.sandboxMode,
-      maxFrameBytes: config.maxFrameBytes
+      maxFrameBytes: config.maxFrameBytes,
+      ...(options.tools !== undefined && options.tools.length > 0
+        ? { tools: options.tools }
+        : {})
     })
 
     const state: SandboxState = { proc, health, pendingRequests, config, callId: options.callId }

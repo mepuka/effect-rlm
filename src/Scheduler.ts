@@ -1,4 +1,4 @@
-import { Deferred, Effect, Exit, Option, PubSub, Queue, Ref, Scope, Stream } from "effect"
+import { Deferred, Duration, Effect, Exit, Option, PubSub, Queue, Ref, Scope, Stream } from "effect"
 import { consumeIteration, recordTokens, reserveLlmCall, snapshot, withLlmPermit } from "./Budget"
 import { extractCodeBlock, extractFinal } from "./CodeExtractor"
 import { RlmConfig } from "./RlmConfig"
@@ -15,11 +15,15 @@ import { SandboxFactory } from "./Sandbox"
 import { RlmRuntime } from "./Runtime"
 import { BridgeRequestId, CallId, CallState, RlmCommand, RlmEvent, TranscriptEntry } from "./RlmTypes"
 
+import type { RlmToolAny } from "./RlmTool"
+
 export interface RunSchedulerOptions {
   readonly query: string
   readonly context: string
   readonly depth?: number
   readonly rootCallId?: CallId
+  readonly tools?: ReadonlyArray<RlmToolAny>
+  readonly outputJsonSchema?: object
 }
 
 // --- Hot-path helpers (untraced for performance) ---
@@ -161,9 +165,18 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       const callScope = yield* Scope.make()
 
       yield* Effect.gen(function*() {
+        const toolDescriptorsForSandbox = command.tools?.map((t) => ({
+          name: t.name,
+          parameterNames: t.parameterNames,
+          description: t.description
+        }))
+
         const sandbox = yield* sandboxFactory.create({
           callId: command.callId,
-          depth: command.depth
+          depth: command.depth,
+          ...(toolDescriptorsForSandbox !== undefined && toolDescriptorsForSandbox.length > 0
+            ? { tools: toolDescriptorsForSandbox }
+            : {})
         }).pipe(Effect.provideService(Scope.Scope, callScope))
 
         yield* sandbox.setVariable("context", command.context)
@@ -180,6 +193,12 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           callScope,
           ...(command.parentBridgeRequestId !== undefined
             ? { parentBridgeRequestId: command.parentBridgeRequestId }
+            : {}),
+          ...(command.tools !== undefined && command.tools.length > 0
+            ? { tools: command.tools }
+            : {}),
+          ...(command.outputJsonSchema !== undefined
+            ? { outputJsonSchema: command.outputJsonSchema }
             : {})
         })
 
@@ -237,6 +256,14 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
 
       yield* reserveLlmCall(callState.callId)
 
+      const toolDescriptors = callState.tools?.map((t) => ({
+        name: t.name,
+        description: t.description,
+        parameterNames: t.parameterNames,
+        parametersJsonSchema: t.parametersJsonSchema,
+        returnsJsonSchema: t.returnsJsonSchema
+      }))
+
       const prompt = buildReplPrompt({
         systemPrompt: buildReplSystemPrompt({
           depth: callState.depth,
@@ -246,7 +273,13 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           budget: {
             iterationsRemaining: budget.iterationsRemaining,
             llmCallsRemaining: budget.llmCallsRemaining
-          }
+          },
+          ...(toolDescriptors !== undefined && toolDescriptors.length > 0
+            ? { tools: toolDescriptors }
+            : {}),
+          ...(callState.outputJsonSchema !== undefined
+            ? { outputJsonSchema: callState.outputJsonSchema }
+            : {})
         }),
         query: callState.query,
         contextLength: callState.context.length,
@@ -420,6 +453,29 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         method: command.method
       }))
 
+      // Tool dispatch: non-llm_query methods route to user-defined tools
+      if (command.method !== "llm_query") {
+        const tool = callState.tools?.find((t) => t.name === command.method)
+        if (!tool) {
+          yield* failBridgeDeferred(command.bridgeRequestId, `Unknown tool: ${command.method}`)
+          return
+        }
+        yield* Effect.forkIn(
+          tool.handle(command.args).pipe(
+            Effect.timeoutFail({
+              duration: Duration.millis(tool.timeoutMs),
+              onTimeout: () => new SandboxError({ message: `Tool ${tool.name} timed out` })
+            }),
+            Effect.flatMap((result) => resolveBridgeDeferred(command.bridgeRequestId, result)),
+            Effect.catchAll((err) =>
+              failBridgeDeferred(command.bridgeRequestId, "message" in err ? err.message : String(err))
+            )
+          ),
+          callState.callScope
+        )
+        return
+      }
+
       if (callState.depth >= config.maxDepth) {
         // At max depth: one-shot model call (no REPL protocol) with budget reservation
         yield* Effect.forkIn(
@@ -585,7 +641,13 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       callId: rootCallId,
       depth: rootDepth,
       query: options.query,
-      context: options.context
+      context: options.context,
+      ...(options.tools !== undefined && options.tools.length > 0
+        ? { tools: options.tools }
+        : {}),
+      ...(options.outputJsonSchema !== undefined
+        ? { outputJsonSchema: options.outputJsonSchema }
+        : {})
     }))
 
     // Stream.fromQueue terminates cleanly when Queue.shutdown is called

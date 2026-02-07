@@ -1,3 +1,11 @@
+export interface ToolDescriptor {
+  readonly name: string
+  readonly description: string
+  readonly parameterNames: ReadonlyArray<string>
+  readonly parametersJsonSchema: object
+  readonly returnsJsonSchema: object
+}
+
 export interface ReplSystemPromptOptions {
   readonly depth: number
   readonly iteration: number
@@ -7,10 +15,14 @@ export interface ReplSystemPromptOptions {
     readonly iterationsRemaining: number
     readonly llmCallsRemaining: number
   }
+  readonly tools?: ReadonlyArray<ToolDescriptor>
+  readonly outputJsonSchema?: object
+  readonly sandboxMode?: "permissive" | "strict"
 }
 
 export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string => {
-  const canRecurse = options.depth < options.maxDepth
+  const isStrict = options.sandboxMode === "strict"
+  const canRecurse = !isStrict && options.depth < options.maxDepth
   const lines: Array<string> = []
 
   lines.push("You are a recursive problem-solving agent with access to a code sandbox.")
@@ -33,6 +45,26 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   if (canRecurse) {
     lines.push("## Recursive Sub-calls")
     lines.push("`llm_query(query, context?)` — make a recursive sub-call to another LLM. Returns a promise.")
+    lines.push("")
+  }
+
+  if (!isStrict && options.tools && options.tools.length > 0) {
+    lines.push("## Available Tools")
+    for (const tool of options.tools) {
+      const params = tool.parameterNames.join(", ")
+      lines.push(`\`${tool.name}(${params})\` — ${tool.description}`)
+      lines.push(`  Parameters: ${JSON.stringify(tool.parametersJsonSchema)}`)
+      lines.push(`  Returns: ${JSON.stringify(tool.returnsJsonSchema)}`)
+      lines.push(`  Usage: \`const result = await ${tool.name}(${tool.parameterNames.map(p => `<${p}>`).join(", ")})\``)
+    }
+    lines.push("")
+  }
+
+  if (options.outputJsonSchema) {
+    lines.push("## Output Format")
+    lines.push("Your FINAL() answer MUST be valid JSON matching this schema:")
+    lines.push(JSON.stringify(options.outputJsonSchema, null, 2))
+    lines.push("Use FINAL(`{...}`) with backticks for JSON content.")
     lines.push("")
   }
 

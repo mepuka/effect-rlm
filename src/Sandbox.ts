@@ -20,12 +20,19 @@ export interface SandboxInstance {
   readonly getVariable: (name: string) => Effect.Effect<unknown, SandboxError>
 }
 
+export interface ToolDescriptorForSandbox {
+  readonly name: string
+  readonly parameterNames: ReadonlyArray<string>
+  readonly description: string
+}
+
 export class SandboxFactory extends Context.Tag("@recursive-llm/SandboxFactory")<
   SandboxFactory,
   {
     readonly create: (options: {
       readonly callId: CallId
       readonly depth: number
+      readonly tools?: ReadonlyArray<ToolDescriptorForSandbox>
     }) => Effect.Effect<SandboxInstance, SandboxError, Scope.Scope>
   }
 >() {}

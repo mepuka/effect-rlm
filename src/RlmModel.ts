@@ -48,6 +48,8 @@ import * as AnthropicLanguageModel from "@effect/ai-anthropic/AnthropicLanguageM
 import type { AnthropicClient } from "@effect/ai-anthropic/AnthropicClient"
 import * as GoogleLanguageModel from "@effect/ai-google/GoogleLanguageModel"
 import type { GoogleClient } from "@effect/ai-google/GoogleClient"
+import * as OpenAiLanguageModel from "@effect/ai-openai/OpenAiLanguageModel"
+import type { OpenAiClient } from "@effect/ai-openai/OpenAiClient"
 
 export const makeAnthropicRlmModel = (options: {
   readonly primaryModel: string
@@ -95,6 +97,35 @@ export const makeGoogleRlmModel = (options: {
     ...(options.subModel !== undefined
       ? {
           sub: GoogleLanguageModel.make({
+            model: options.subModel,
+            ...((options.subConfig ?? options.primaryConfig) !== undefined
+              ? { config: (options.subConfig ?? options.primaryConfig)! }
+              : {})
+          })
+        }
+      : {}),
+    ...(options.depthThreshold !== undefined
+      ? { depthThreshold: options.depthThreshold }
+      : {})
+  })
+
+export const makeOpenAiRlmModel = (options: {
+  readonly primaryModel: string
+  readonly primaryConfig?: Omit<OpenAiLanguageModel.Config.Service, "model">
+  readonly subModel?: string
+  readonly subConfig?: Omit<OpenAiLanguageModel.Config.Service, "model">
+  readonly depthThreshold?: number
+}): Layer.Layer<RlmModel, never, OpenAiClient> =>
+  makeRlmModelLayer({
+    primary: OpenAiLanguageModel.make({
+      model: options.primaryModel,
+      ...(options.primaryConfig !== undefined
+        ? { config: options.primaryConfig }
+        : {})
+    }),
+    ...(options.subModel !== undefined
+      ? {
+          sub: OpenAiLanguageModel.make({
             model: options.subModel,
             ...((options.subConfig ?? options.primaryConfig) !== undefined
               ? { config: (options.subConfig ?? options.primaryConfig)! }

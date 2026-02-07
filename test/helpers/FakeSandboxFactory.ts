@@ -13,7 +13,7 @@ export const makeFakeSandboxFactoryLayer = (
   Layer.succeed(
     SandboxFactory,
     SandboxFactory.of({
-      create: () => {
+      create: (_options) => {
         if (metrics) {
           metrics.createCalls += 1
         }

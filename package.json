@@ -5,7 +5,8 @@
   "private": true,
   "scripts": {
     "prepare": "effect-language-service patch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "rlm": "bun run src/cli.ts"
   },
   "devDependencies": {
     "@effect/language-service": "^0.73.0",
@@ -21,6 +22,7 @@
     "@effect/ai-openai": "^0.37.2",
     "@effect/experimental": "^0.58.0",
     "@effect/platform": "^0.94.3",
+    "@effect/platform-bun": "^0.87.1",
     "effect": "^3.19.16"
   }
 }

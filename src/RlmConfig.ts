@@ -6,7 +6,6 @@ export interface RlmConfigService {
   readonly maxLlmCalls: number
   readonly maxTotalTokens: number | null
   readonly concurrency: number
-  readonly commandQueueCapacity: number
   readonly eventBufferCapacity: number
 }
 
@@ -19,7 +18,6 @@ export class RlmConfig extends Context.Reference<RlmConfig>()(
       maxLlmCalls: 20,
       maxTotalTokens: null,
       concurrency: 4,
-      commandQueueCapacity: 1024,
       eventBufferCapacity: 4096
     })
   }

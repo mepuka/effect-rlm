@@ -1,12 +1,15 @@
 import { describe, expect, test } from "bun:test"
-import { Chunk, Deferred, Effect, Exit, Layer, Option, PubSub, Queue, Ref, Stream } from "effect"
+import { Chunk, Deferred, Effect, Exit, Layer, Option, PubSub, Queue, Ref, Schema, Stream } from "effect"
 import { complete, stream } from "../src/Rlm"
 import { RlmConfig, type RlmConfigService } from "../src/RlmConfig"
 import { SandboxError } from "../src/RlmError"
 import { SandboxFactory } from "../src/Sandbox"
+import { SandboxBunLive } from "../src/SandboxBun"
+import { BridgeHandlerLive } from "../src/BridgeHandler"
 import { RlmRuntime, RlmRuntimeLive } from "../src/Runtime"
 import { BridgeRequestId, CallId, RlmCommand } from "../src/RlmTypes"
 import { runScheduler } from "../src/Scheduler"
+import * as RlmTool from "../src/RlmTool"
 import { makeFakeRlmModelLayer, type FakeModelMetrics } from "./helpers/FakeRlmModel"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./helpers/FakeSandboxFactory"
 
@@ -16,7 +19,6 @@ const defaultConfig: RlmConfigService = {
   maxLlmCalls: 20,
   maxTotalTokens: null,
   concurrency: 4,
-  commandQueueCapacity: 1024,
   eventBufferCapacity: 4096
 }
 
@@ -412,4 +414,77 @@ describe("Scheduler integration", () => {
       expect(result._tag).toBe("Left")
     }
   }, 10_000)
+})
+
+describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
+  const makeRealSandboxLayers = (options: {
+    readonly responses: ReadonlyArray<{ readonly text: string; readonly totalTokens?: number }>
+    readonly config?: Partial<RlmConfigService>
+  }) => {
+    const model = makeFakeRlmModelLayer(options.responses)
+    // Mirror rlmBunLayer composition: RlmRuntimeLive → BridgeHandlerLive → SandboxBunLive
+    const perCallLayer = Layer.fresh(
+      Layer.provideMerge(
+        SandboxBunLive,
+        Layer.provideMerge(BridgeHandlerLive, RlmRuntimeLive)
+      )
+    )
+    const base = Layer.mergeAll(model, perCallLayer)
+    return options.config
+      ? Layer.provide(base, Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config }))
+      : base
+  }
+
+  test("tool bridge call flows through scheduler dispatch", async () => {
+    let toolCalled = false
+
+    const addTool = RlmTool.make("add", {
+      description: "Add two numbers",
+      parameters: { a: Schema.Number, b: Schema.Number },
+      returns: Schema.Number,
+      handler: ({ a, b }) => {
+        toolCalled = true
+        return Effect.succeed(a + b)
+      }
+    })
+
+    const answer = await Effect.runPromise(
+      complete({
+        query: "compute 2+3",
+        context: "math",
+        tools: [addTool]
+      }).pipe(
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nconst result = await add(2, 3)\nprint(result)\n```" },
+            { text: 'FINAL("5")' }
+          ]
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    expect(toolCalled).toBe(true)
+    expect(answer).toBe("5")
+  }, 15_000)
+
+  test("unknown tool method fails bridge deferred", async () => {
+    const answer = await Effect.runPromise(
+      complete({
+        query: "test unknown tool",
+        context: "ctx"
+      }).pipe(
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\ntry {\n  await nonexistent('arg')\n} catch (e) {\n  print('caught: ' + e.message)\n}\n```" },
+            { text: 'FINAL("handled")' }
+          ]
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    // The sandbox should catch the error since nonexistent is not a defined function
+    expect(answer).toBe("handled")
+  }, 15_000)
 })

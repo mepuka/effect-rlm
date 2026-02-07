@@ -12,6 +12,7 @@ const vars = new Map<string, unknown>()
 let workerCallId = "unknown"
 let workerDepth = 0
 let sandboxMode: "permissive" | "strict" = "permissive"
+let toolFunctions: Record<string, (...args: unknown[]) => Promise<unknown>> = {}
 
 // Pending bridge calls: requestId → { resolve, reject }
 const pendingBridge = new Map<
@@ -51,7 +52,8 @@ const STRICT_BLOCKLIST: ReadonlyArray<{
 const makeStrictScope = (
   print: (...args: unknown[]) => void,
   __vars: unknown,
-  llm_query: (query: string, context?: string) => Promise<unknown>
+  llm_query: (query: string, context?: string) => Promise<unknown>,
+  tools?: Record<string, (...args: unknown[]) => Promise<unknown>>
 ) => {
   const scope: Record<string, unknown> = {
     // Explicitly provided worker bindings
@@ -59,6 +61,8 @@ const makeStrictScope = (
     __vars,
     llm_query,
     undefined,
+    // Tool functions
+    ...tools,
 
     // Common JS built-ins
     Array,
@@ -223,17 +227,20 @@ async function executeCode(requestId: string, code: string): Promise<void> {
 
     // AsyncFunction constructor to allow top-level await in code
     const AsyncFunction = Object.getPrototypeOf(async function() {}).constructor
+    const toolNames = Object.keys(toolFunctions)
+    const toolValues = Object.values(toolFunctions)
+
     if (sandboxMode === "strict") {
-      const strictScope = makeStrictScope(print, __vars, llm_query)
-      const fn = new AsyncFunction("print", "__vars", "llm_query", "__strictScope", `
+      const strictScope = makeStrictScope(print, __vars, llm_query, toolFunctions)
+      const fn = new AsyncFunction("print", "__vars", "llm_query", "__strictScope", ...toolNames, `
         with (__strictScope) {
           ${code}
         }
       `)
-      await fn(print, __vars, llm_query, strictScope)
+      await fn(print, __vars, llm_query, strictScope, ...toolValues)
     } else {
-      const fn = new AsyncFunction("print", "__vars", "llm_query", code)
-      await fn(print, __vars, llm_query)
+      const fn = new AsyncFunction("print", "__vars", "llm_query", ...toolNames, code)
+      await fn(print, __vars, llm_query, ...toolValues)
     }
 
     safeSend({
@@ -270,7 +277,37 @@ function handleMessage(message: unknown): void {
           Number.isInteger(msg.maxFrameBytes) && msg.maxFrameBytes <= 64 * 1024 * 1024) {
         maxFrameBytes = msg.maxFrameBytes
       }
-      console.error(`[sandbox-worker] Init: callId=${workerCallId} depth=${workerDepth} mode=${sandboxMode} maxFrameBytes=${maxFrameBytes}`)
+
+      // Create tool bridge functions from tool descriptors
+      toolFunctions = {}
+      const jsIdentifierRe = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/
+      const reservedBindings = new Set(["print", "__vars", "llm_query", "__strictScope"])
+      if (Array.isArray(msg.tools)) {
+        for (const tool of msg.tools) {
+          const toolName = String(tool.name)
+          if (!jsIdentifierRe.test(toolName) || reservedBindings.has(toolName)) {
+            console.error(`[sandbox-worker] Skipping invalid tool name: ${toolName}`)
+            continue
+          }
+          toolFunctions[toolName] = async (...args: unknown[]): Promise<unknown> => {
+            if (sandboxMode === "strict") {
+              throw new Error("Bridge disabled in strict sandbox mode")
+            }
+            const bridgeRequestId = crypto.randomUUID()
+            return new Promise((resolve, reject) => {
+              pendingBridge.set(bridgeRequestId, { resolve, reject })
+              safeSend({
+                _tag: "BridgeCall",
+                requestId: bridgeRequestId,
+                method: toolName,
+                args
+              })
+            })
+          }
+        }
+      }
+
+      console.error(`[sandbox-worker] Init: callId=${workerCallId} depth=${workerDepth} mode=${sandboxMode} maxFrameBytes=${maxFrameBytes} tools=${Object.keys(toolFunctions).join(",")}`)
       break
     }
 
@@ -329,6 +366,7 @@ function handleMessage(message: unknown): void {
         pending.reject(new Error("Worker shutting down"))
         pendingBridge.delete(id)
       }
+      toolFunctions = {}
       process.exit(0)
       break
     }

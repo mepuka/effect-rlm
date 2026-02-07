@@ -1,6 +1,7 @@
 import { Brand, Data, Option, Scope } from "effect"
 import type { SandboxInstance } from "./Sandbox"
 import type { RlmError } from "./RlmError"
+import type { RlmToolAny } from "./RlmTool"
 
 // --- Branded IDs ---
 
@@ -33,6 +34,8 @@ export class CallState extends Data.Class<{
   readonly sandbox: SandboxInstance
   readonly callScope: Scope.CloseableScope
   readonly parentBridgeRequestId?: BridgeRequestId
+  readonly tools?: ReadonlyArray<RlmToolAny>
+  readonly outputJsonSchema?: object
 }> {}
 
 // --- Tagged Enums ---
@@ -44,6 +47,8 @@ export type RlmCommand = Data.TaggedEnum<{
     readonly query: string
     readonly context: string
     readonly parentBridgeRequestId?: BridgeRequestId
+    readonly tools?: ReadonlyArray<RlmToolAny>
+    readonly outputJsonSchema?: object
   }
   GenerateStep: { readonly callId: CallId }
   ExecuteCode: { readonly callId: CallId; readonly code: string }

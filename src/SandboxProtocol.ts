@@ -36,7 +36,12 @@ export class Init extends Schema.TaggedStruct("Init", {
     Schema.int(),
     Schema.positive(),
     Schema.lessThanOrEqualTo(64 * 1024 * 1024)
-  ))
+  )),
+  tools: Schema.optional(Schema.Array(Schema.Struct({
+    name: Schema.String,
+    parameterNames: Schema.Array(Schema.String),
+    description: Schema.String
+  })))
 }) {}
 
 export class Shutdown extends Schema.TaggedStruct("Shutdown", {}) {}

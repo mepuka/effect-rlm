@@ -40,10 +40,19 @@ export class UnknownRlmError extends Schema.TaggedError<UnknownRlmError>()(
   }
 ) {}
 
+export class OutputValidationError extends Schema.TaggedError<OutputValidationError>()(
+  "OutputValidationError",
+  {
+    message: Schema.String,
+    raw: Schema.String
+  }
+) {}
+
 export type RlmError =
   | BudgetExhaustedError
   | NoFinalAnswerError
   | CallStateMissingError
   | SandboxError
   | UnknownRlmError
+  | OutputValidationError
 

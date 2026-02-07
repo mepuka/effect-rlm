@@ -21,10 +21,6 @@ export const BridgeHandlerLive: Layer.Layer<BridgeHandler, never, RlmRuntime> = 
 
     return BridgeHandler.of({
       handle: ({ method, args, callerCallId }) => {
-        if (method !== "llm_query") {
-          return Effect.fail(new SandboxError({ message: `Unknown bridge method: ${method}` }))
-        }
-
         const bridgeRequestId = BridgeRequestId(crypto.randomUUID())
 
         return Effect.gen(function*() {

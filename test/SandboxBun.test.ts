@@ -408,4 +408,75 @@ describe("SandboxBun", () => {
       }).pipe(Effect.provide(makeTestLayer()))
     )
   }, 30_000)
+
+  test("tool bridge call flows through BridgeHandler with correct method name", async () => {
+    const bridgeCalls: Array<{ method: string; args: ReadonlyArray<unknown> }> = []
+
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({
+            callId: "test" as CallId,
+            depth: 0,
+            tools: [
+              { name: "search", parameterNames: ["query", "maxResults"], description: "Search the web" }
+            ]
+          })
+          return yield* sandbox.execute("const r = await search('effect typescript', 5); print(JSON.stringify(r))")
+        })
+      ).pipe(
+        Effect.provide(
+          makeTestLayer(({ method, args }) => {
+            bridgeCalls.push({ method, args: [...args] })
+            return Effect.succeed([{ title: "Effect Docs", snippet: "..." }])
+          })
+        )
+      )
+    )
+
+    expect(result).toBe(JSON.stringify([{ title: "Effect Docs", snippet: "..." }]))
+    expect(bridgeCalls).toHaveLength(1)
+    expect(bridgeCalls[0]!.method).toBe("search")
+    expect(bridgeCalls[0]!.args).toEqual(["effect typescript", 5])
+  })
+
+  test("multiple tool calls in single execution", async () => {
+    const bridgeCalls: Array<{ method: string; args: ReadonlyArray<unknown> }> = []
+
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({
+            callId: "test" as CallId,
+            depth: 0,
+            tools: [
+              { name: "add", parameterNames: ["a", "b"], description: "Add two numbers" },
+              { name: "multiply", parameterNames: ["a", "b"], description: "Multiply two numbers" }
+            ]
+          })
+          return yield* sandbox.execute(`
+            const sum = await add(2, 3)
+            const product = await multiply(4, 5)
+            print(sum + "," + product)
+          `)
+        })
+      ).pipe(
+        Effect.provide(
+          makeTestLayer(({ method, args }) => {
+            bridgeCalls.push({ method, args: [...args] })
+            if (method === "add") return Effect.succeed((args[0] as number) + (args[1] as number))
+            if (method === "multiply") return Effect.succeed((args[0] as number) * (args[1] as number))
+            return Effect.succeed(null)
+          })
+        )
+      )
+    )
+
+    expect(result).toBe("5,20")
+    expect(bridgeCalls).toHaveLength(2)
+    expect(bridgeCalls[0]!.method).toBe("add")
+    expect(bridgeCalls[1]!.method).toBe("multiply")
+  })
 })

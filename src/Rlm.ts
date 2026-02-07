@@ -1,31 +1,51 @@
-import { Context, Effect, Layer, PubSub, Stream } from "effect"
+import { Context, Effect, Layer, PubSub, Schema, Stream } from "effect"
 import { BridgeHandlerLive } from "./BridgeHandler"
 import { RlmModel } from "./RlmModel"
 import type { RlmError } from "./RlmError"
+import { OutputValidationError } from "./RlmError"
 import { RlmRuntime, RlmRuntimeLive } from "./Runtime"
 import { CallId, RlmEvent } from "./RlmTypes"
+import type { RunSchedulerOptions } from "./Scheduler"
 import { runScheduler } from "./Scheduler"
 import { SandboxFactory } from "./Sandbox"
 import { SandboxBunLive } from "./SandboxBun"
+import type { RlmToolAny } from "./RlmTool"
+import { JSONSchema } from "effect"
 
-export interface CompleteOptions {
+export interface CompleteOptionsBase {
   readonly query: string
   readonly context: string
   readonly depth?: number
+  readonly tools?: ReadonlyArray<RlmToolAny>
 }
+
+export interface CompleteOptionsTyped<A> extends CompleteOptionsBase {
+  readonly outputSchema: Schema.Schema<A, any, never>
+}
+
+export type CompleteOptions<A = string> = A extends string
+  ? CompleteOptionsBase & { readonly outputSchema?: undefined }
+  : CompleteOptionsTyped<A>
 
 export interface RlmService {
-  readonly stream: (options: CompleteOptions) => Stream.Stream<RlmEvent, never>
-  readonly complete: (options: CompleteOptions) => Effect.Effect<string, RlmError>
+  readonly stream: (options: CompleteOptionsBase) => Stream.Stream<RlmEvent, never>
+  readonly complete: {
+    (options: CompleteOptionsBase): Effect.Effect<string, RlmError>
+    <A>(options: CompleteOptionsTyped<A>): Effect.Effect<A, RlmError>
+  }
 }
 
-const toSchedulerOptions = (options: CompleteOptions) => ({
+const toSchedulerOptions = (options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }): RunSchedulerOptions => ({
   query: options.query,
   context: options.context,
-  ...(options.depth !== undefined ? { depth: options.depth } : {})
+  ...(options.depth !== undefined ? { depth: options.depth } : {}),
+  ...(options.tools !== undefined && options.tools.length > 0 ? { tools: options.tools } : {}),
+  ...(options.outputSchema !== undefined
+    ? { outputJsonSchema: JSONSchema.make(options.outputSchema) }
+    : {})
 })
 
-const streamInternal = (options: CompleteOptions) =>
+const streamInternal = (options: CompleteOptionsBase) =>
   Stream.unwrapScoped(
     Effect.gen(function*() {
       const runtime = yield* RlmRuntime
@@ -50,8 +70,21 @@ const streamInternal = (options: CompleteOptions) =>
     })
   )
 
-const completeInternal = Effect.fn("Rlm.complete")(function*(options: CompleteOptions) {
-  return yield* runScheduler(toSchedulerOptions(options))
+const completeInternal = Effect.fn("Rlm.complete")(function*(
+  options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }
+) {
+  const raw = yield* runScheduler(toSchedulerOptions(options))
+
+  if (!options.outputSchema) {
+    return raw
+  }
+
+  return yield* Schema.decodeUnknown(Schema.parseJson(options.outputSchema))(raw).pipe(
+    Effect.mapError((e) => new OutputValidationError({
+      message: `FINAL() content does not match output schema: ${String(e)}`,
+      raw
+    }))
+  )
 })
 
 export class Rlm extends Context.Tag("@recursive-llm/Rlm")<
@@ -71,10 +104,10 @@ export const rlmLayer: Layer.Layer<Rlm, never, RlmModel | SandboxFactory> = Laye
     )
 
     return Rlm.of({
-      complete: (options) =>
+      complete: ((options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }) =>
         completeInternal(options).pipe(
           Effect.provide(Layer.provideMerge(Layer.fresh(RlmRuntimeLive), dependencies))
-        ),
+        )) as RlmService["complete"],
       stream: (options) =>
         streamInternal(options).pipe(
           Stream.provideLayer(Layer.provideMerge(Layer.fresh(RlmRuntimeLive), dependencies))
@@ -103,8 +136,8 @@ export const rlmBunLayer: Layer.Layer<Rlm, never, RlmModel> = Layer.effect(
     }
 
     return Rlm.of({
-      complete: (options) =>
-        completeInternal(options).pipe(Effect.provide(makePerCallDeps())),
+      complete: ((options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }) =>
+        completeInternal(options).pipe(Effect.provide(makePerCallDeps()))) as RlmService["complete"],
       stream: (options) =>
         streamInternal(options).pipe(Stream.provideLayer(makePerCallDeps()))
     })

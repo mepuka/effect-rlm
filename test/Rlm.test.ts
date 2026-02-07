@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test"
-import { Chunk, Effect, Layer, Stream } from "effect"
+import { Chunk, Effect, Layer, Schema, Stream } from "effect"
 import { complete, stream } from "../src/Rlm"
 import { RlmConfig, type RlmConfigService } from "../src/RlmConfig"
-import { BudgetExhaustedError } from "../src/RlmError"
+import { BudgetExhaustedError, OutputValidationError } from "../src/RlmError"
 import { RlmRuntimeLive } from "../src/Runtime"
 import { makeFakeRlmModelLayer, type FakeModelMetrics } from "./helpers/FakeRlmModel"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./helpers/FakeSandboxFactory"
@@ -13,7 +13,6 @@ const defaultConfig: RlmConfigService = {
   maxLlmCalls: 20,
   maxTotalTokens: null,
   concurrency: 4,
-  commandQueueCapacity: 1024,
   eventBufferCapacity: 4096
 }
 
@@ -133,5 +132,105 @@ describe("Rlm thin slice", () => {
     const second = await runOnce()
 
     expect(first).toEqual(second)
+  })
+})
+
+describe("Rlm typed output", () => {
+  test("complete with outputSchema returns parsed object", async () => {
+    const ResultSchema = Schema.Struct({
+      answer: Schema.Number,
+      unit: Schema.String
+    })
+
+    const result = await Effect.runPromise(
+      complete({
+        query: "What is 2+2?",
+        context: "math",
+        outputSchema: ResultSchema
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [{ text: 'FINAL(`{"answer": 4, "unit": "count"}`)' }]
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toEqual({ answer: 4, unit: "count" })
+    }
+  })
+
+  test("complete with outputSchema fails on invalid JSON", async () => {
+    const ResultSchema = Schema.Struct({ value: Schema.Number })
+
+    const result = await Effect.runPromise(
+      complete({
+        query: "test",
+        context: "ctx",
+        outputSchema: ResultSchema
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [{ text: 'FINAL("not json")' }]
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") {
+      expect(result.left).toBeInstanceOf(OutputValidationError)
+      expect(result.left.message).toContain("JSON Parse error")
+    }
+  })
+
+  test("complete with outputSchema fails on schema mismatch", async () => {
+    const ResultSchema = Schema.Struct({ value: Schema.Number })
+
+    const result = await Effect.runPromise(
+      complete({
+        query: "test",
+        context: "ctx",
+        outputSchema: ResultSchema
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [{ text: 'FINAL(`{"value": "not a number"}`)' }]
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") {
+      expect(result.left).toBeInstanceOf(OutputValidationError)
+      expect(result.left.message).toContain("does not match output schema")
+    }
+  })
+
+  test("complete without outputSchema returns raw string (backward compat)", async () => {
+    const result = await Effect.runPromise(
+      complete({
+        query: "test",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [{ text: 'FINAL("hello world")' }]
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("hello world")
+    }
   })
 })
