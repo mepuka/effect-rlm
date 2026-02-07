@@ -1,5 +1,5 @@
 import { Effect, Layer } from "effect"
-import { SandboxFactory } from "../Sandbox"
+import { SandboxFactory } from "../../src/Sandbox"
 
 export interface FakeSandboxMetrics {
   createCalls: number

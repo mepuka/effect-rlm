@@ -11,7 +11,7 @@ import {
   SetVar,
   checkFrameSize,
   decodeWorkerToHost
-} from "./SandboxProtocol"
+} from "../src/SandboxProtocol"
 
 describe("SandboxProtocol", () => {
   describe("HostToWorker", () => {

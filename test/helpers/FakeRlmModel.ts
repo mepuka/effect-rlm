@@ -2,8 +2,8 @@ import * as LanguageModel from "@effect/ai/LanguageModel"
 import * as Response from "@effect/ai/Response"
 import type * as Prompt from "@effect/ai/Prompt"
 import { Effect, Layer } from "effect"
-import { RlmModel } from "../RlmModel"
-import { UnknownRlmError } from "../RlmError"
+import { RlmModel } from "../../src/RlmModel"
+import { UnknownRlmError } from "../../src/RlmError"
 
 export interface FakeModelMetrics {
   calls: number

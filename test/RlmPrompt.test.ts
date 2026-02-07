@@ -5,8 +5,8 @@ import {
   truncateOutput,
   MAX_OUTPUT_CHARS,
   MAX_ONESHOT_CONTEXT_CHARS
-} from "./RlmPrompt"
-import { TranscriptEntry } from "./RlmTypes"
+} from "../src/RlmPrompt"
+import { TranscriptEntry } from "../src/RlmTypes"
 
 describe("truncateOutput", () => {
   test("passes through output under limit", () => {

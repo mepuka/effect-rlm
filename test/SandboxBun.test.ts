@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Exit, Fiber, Layer, Scope } from "effect"
-import { BridgeHandler } from "./BridgeHandler"
-import { SandboxError } from "./RlmError"
-import { SandboxConfig, SandboxFactory } from "./Sandbox"
-import { SandboxBunLive } from "./SandboxBun"
-import type { CallId } from "./RlmTypes"
+import { BridgeHandler } from "../src/BridgeHandler"
+import { SandboxError } from "../src/RlmError"
+import { SandboxConfig, SandboxFactory } from "../src/Sandbox"
+import { SandboxBunLive } from "../src/SandboxBun"
+import type { CallId } from "../src/RlmTypes"
 
 // Mock BridgeHandler that resolves with a fixed response
 const makeBridgeHandlerLayer = (
@@ -26,10 +26,10 @@ const testConfig: SandboxConfig["Type"] = {
   maxFrameBytes: 4 * 1024 * 1024,
   maxBridgeConcurrency: 4,
   incomingFrameQueueCapacity: 2_048,
-  workerPath: new URL("./sandbox-worker.ts", import.meta.url).pathname
+  workerPath: new URL("../src/sandbox-worker.ts", import.meta.url).pathname
 }
-const stubbornWorkerPath = new URL("./testing/sandbox-worker-stubborn.ts", import.meta.url).pathname
-const inspectWorkerPath = new URL("./testing/sandbox-worker-inspect-process.ts", import.meta.url).pathname
+const stubbornWorkerPath = new URL("./helpers/sandbox-worker-stubborn.ts", import.meta.url).pathname
+const inspectWorkerPath = new URL("./helpers/sandbox-worker-inspect-process.ts", import.meta.url).pathname
 
 const makeTestLayer = (
   bridgeHandler?: (options: { method: string; args: ReadonlyArray<unknown>; callerCallId: CallId }) => Effect.Effect<unknown, SandboxError>,

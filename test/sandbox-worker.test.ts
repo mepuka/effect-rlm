@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import type { Subprocess } from "bun"
 
-const WORKER_PATH = new URL("./sandbox-worker.ts", import.meta.url).pathname
+const WORKER_PATH = new URL("../src/sandbox-worker.ts", import.meta.url).pathname
 
 interface WorkerHandle {
   proc: Subprocess<"ignore", "ignore", "inherit">

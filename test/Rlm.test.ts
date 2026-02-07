@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import { Chunk, Effect, Layer, Stream } from "effect"
-import { complete, stream } from "./Rlm"
-import { RlmConfig, type RlmConfigService } from "./RlmConfig"
-import { BudgetExhaustedError } from "./RlmError"
-import { RlmRuntimeLive } from "./Runtime"
-import { makeFakeRlmModelLayer, type FakeModelMetrics } from "./testing/FakeRlmModel"
-import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./testing/FakeSandboxFactory"
+import { complete, stream } from "../src/Rlm"
+import { RlmConfig, type RlmConfigService } from "../src/RlmConfig"
+import { BudgetExhaustedError } from "../src/RlmError"
+import { RlmRuntimeLive } from "../src/Runtime"
+import { makeFakeRlmModelLayer, type FakeModelMetrics } from "./helpers/FakeRlmModel"
+import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./helpers/FakeSandboxFactory"
 
 const defaultConfig: RlmConfigService = {
   maxIterations: 10,

@@ -14,5 +14,3 @@ export * from "./SandboxBun"
 export * from "./SandboxProtocol"
 export * from "./Scheduler"
 
-export * from "./testing/FakeRlmModel"
-export * from "./testing/FakeSandboxFactory"

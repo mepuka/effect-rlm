@@ -51,4 +51,3 @@ process.on("message", (message: unknown) => {
 process.on("disconnect", () => {
   process.exit(1)
 })
-

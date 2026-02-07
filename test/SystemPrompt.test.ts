@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { buildReplSystemPrompt, buildOneShotSystemPrompt } from "./SystemPrompt"
+import { buildReplSystemPrompt, buildOneShotSystemPrompt } from "../src/SystemPrompt"
 
 describe("SystemPrompt", () => {
   const baseOptions = {
