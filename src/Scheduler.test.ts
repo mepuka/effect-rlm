@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { Chunk, Effect, Layer, Option, PubSub, Queue, Ref, Stream } from "effect"
+import { Chunk, Deferred, Effect, Exit, Layer, Option, PubSub, Queue, Ref, Stream } from "effect"
 import { complete, stream } from "./Rlm"
 import { RlmConfig, type RlmConfigService } from "./RlmConfig"
 import { SandboxError } from "./RlmError"
 import { SandboxFactory } from "./Sandbox"
 import { RlmRuntime, RlmRuntimeLive } from "./Runtime"
-import { RlmCommand, CallId } from "./RlmTypes"
+import { BridgeRequestId, CallId, RlmCommand } from "./RlmTypes"
 import { runScheduler } from "./Scheduler"
 import { makeFakeLanguageModelClientLayer, type FakeModelMetrics } from "./testing/FakeLanguageModelClient"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./testing/FakeSandboxFactory"
@@ -313,7 +313,7 @@ describe("Scheduler integration", () => {
     expect(staleWarning).toBeDefined()
   })
 
-  test("scheduler interruption closes remaining call scopes", async () => {
+  test("scheduler interruption closes call scopes, bridge pending state, and command queue", async () => {
     const hangingSandboxLayer = Layer.succeed(
       SandboxFactory,
       SandboxFactory.of({
@@ -335,18 +335,45 @@ describe("Scheduler integration", () => {
     const result = await Effect.runPromise(
       Effect.gen(function*() {
         const runtime = yield* RlmRuntime
+        const leakedBridge = yield* Deferred.make<unknown, SandboxError>()
+        const leakedBridgeRequestId = BridgeRequestId("leaked-bridge")
+        yield* Ref.update(runtime.bridgePending, (current) => {
+          const next = new Map(current)
+          next.set(leakedBridgeRequestId, leakedBridge)
+          return next
+        })
+
         const timeout = yield* runScheduler({
           query: "hang forever",
           context: "ctx"
         }).pipe(Effect.timeoutOption("200 millis"))
 
         const statesAfter = yield* Ref.get(runtime.callStates)
-        return { timeout, remainingStates: statesAfter.size }
+        const bridgePendingAfter = yield* Ref.get(runtime.bridgePending)
+        const leakedBridgeResult = yield* Deferred.await(leakedBridge).pipe(Effect.either)
+        const offerAfterShutdown = yield* Effect.exit(
+          Queue.offer(runtime.commands, RlmCommand.GenerateStep({ callId: CallId("after-timeout") }))
+        )
+
+        return {
+          timeout,
+          remainingStates: statesAfter.size,
+          remainingBridgePending: bridgePendingAfter.size,
+          leakedBridgeResult,
+          offerAfterShutdown
+        }
       }).pipe(Effect.provide(layers))
     )
 
     expect(Option.isNone(result.timeout)).toBe(true)
     expect(result.remainingStates).toBe(0)
+    expect(result.remainingBridgePending).toBe(0)
+    expect(result.leakedBridgeResult._tag).toBe("Left")
+    if (result.leakedBridgeResult._tag === "Left") {
+      expect(result.leakedBridgeResult.left).toBeInstanceOf(SandboxError)
+      expect(result.leakedBridgeResult.left.message).toContain("Scheduler stopped")
+    }
+    expect(Exit.isFailure(result.offerAfterShutdown)).toBe(true)
   })
 
   test("StartCall failure with failing sandbox factory does not hang", async () => {

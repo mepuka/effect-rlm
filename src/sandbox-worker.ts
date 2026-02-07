@@ -22,9 +22,30 @@ const pendingBridge = new Map<
 // Max frame size (configurable via Init, default 4MB)
 let maxFrameBytes = 4 * 1024 * 1024
 
-const STRICT_BLOCKLIST = [
-  /\bimport\s*\(/,
-  /\brequire\s*\(/
+const STRICT_BLOCKLIST: ReadonlyArray<{
+  readonly pattern: RegExp
+  readonly message: string
+}> = [
+  {
+    pattern: /\bimport\s*\(/,
+    message: "Strict sandbox blocks dynamic module loading"
+  },
+  {
+    pattern: /\brequire\s*\(/,
+    message: "Strict sandbox blocks dynamic module loading"
+  },
+  {
+    pattern: /\bFunction\s*\(/,
+    message: "Strict sandbox blocks Function constructor"
+  },
+  {
+    pattern: /\.\s*constructor\s*\.\s*constructor\s*\(/,
+    message: "Strict sandbox blocks constructor escape"
+  },
+  {
+    pattern: /\.\s*constructor\s*\(/,
+    message: "Strict sandbox blocks constructor escape"
+  }
 ]
 
 const makeStrictScope = (
@@ -193,9 +214,9 @@ async function executeCode(requestId: string, code: string): Promise<void> {
 
   try {
     if (sandboxMode === "strict") {
-      for (const pattern of STRICT_BLOCKLIST) {
-        if (pattern.test(code)) {
-          throw new Error("Strict sandbox blocks dynamic module loading")
+      for (const blocked of STRICT_BLOCKLIST) {
+        if (blocked.pattern.test(code)) {
+          throw new Error(blocked.message)
         }
       }
     }

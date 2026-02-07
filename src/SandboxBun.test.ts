@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Exit, Layer, Scope } from "effect"
+import { Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { BridgeHandler } from "./BridgeHandler"
 import { SandboxError } from "./RlmError"
 import { SandboxConfig, SandboxFactory } from "./Sandbox"
@@ -29,6 +29,7 @@ const testConfig: SandboxConfig["Type"] = {
   workerPath: new URL("./sandbox-worker.ts", import.meta.url).pathname
 }
 const stubbornWorkerPath = new URL("./testing/sandbox-worker-stubborn.ts", import.meta.url).pathname
+const inspectWorkerPath = new URL("./testing/sandbox-worker-inspect-process.ts", import.meta.url).pathname
 
 const makeTestLayer = (
   bridgeHandler?: (options: { method: string; args: ReadonlyArray<unknown>; callerCallId: CallId }) => Effect.Effect<unknown, SandboxError>,
@@ -188,6 +189,43 @@ describe("SandboxBun", () => {
     expect(bridgeCallCount).toBe(0)
   })
 
+  test("strict mode spawns worker with isolated cwd/env settings", async () => {
+    const raw = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "test" as CallId, depth: 0 })
+          return yield* sandbox.execute("report")
+        })
+      ).pipe(
+        Effect.provide(
+          makeTestLayer(undefined, {
+            sandboxMode: "strict",
+            workerPath: inspectWorkerPath
+          })
+        )
+      )
+    )
+
+    const report = JSON.parse(raw) as {
+      readonly sandboxMode: "permissive" | "strict"
+      readonly cwd: string
+      readonly envKeys: ReadonlyArray<string>
+    }
+    const normalizePath = (path: string) =>
+      path
+        .replace(/\/+$/, "")
+        .replace(/^\/private\//, "/")
+
+    const expectedStrictCwd = normalizePath(Bun.env.TMPDIR ?? process.env.TMPDIR ?? "/tmp")
+    const reportedCwd = normalizePath(report.cwd)
+
+    expect(report.sandboxMode).toBe("strict")
+    expect(reportedCwd.startsWith(expectedStrictCwd)).toBe(true)
+    expect(report.cwd).not.toBe(process.cwd())
+    expect(report.envKeys).toEqual([])
+  })
+
   test("execute timeout returns SandboxError", async () => {
     const result = await Effect.runPromise(
       Effect.scoped(
@@ -304,4 +342,70 @@ describe("SandboxBun", () => {
     const elapsed = Date.now() - startedAt
     expect(elapsed).toBeLessThan(3_000)
   }, 10_000)
+
+  test("teardown race stress: pending executes fail promptly across many scopes", async () => {
+    const runs = Array.from({ length: 20 }, (_, i) => i)
+    const startedAt = Date.now()
+
+    await Effect.runPromise(
+      Effect.gen(function*() {
+        const factory = yield* SandboxFactory
+
+        yield* Effect.forEach(runs, (index) =>
+          Effect.gen(function*() {
+            const scope = yield* Scope.make()
+            const sandbox = yield* factory.create({ callId: `race-${index}` as CallId, depth: 0 }).pipe(
+              Effect.provideService(Scope.Scope, scope)
+            )
+
+            const pending = yield* Effect.fork(
+              sandbox.execute("await new Promise(() => {})").pipe(Effect.either)
+            )
+
+            yield* Effect.sleep("5 millis")
+            yield* Scope.close(scope, Exit.void)
+
+            const result = yield* Fiber.join(pending)
+            expect(result._tag).toBe("Left")
+          }),
+          { concurrency: 4, discard: true }
+        )
+      }).pipe(
+        Effect.provide(
+          makeTestLayer(undefined, {
+            executeTimeoutMs: 30_000,
+            shutdownGraceMs: 150
+          })
+        )
+      )
+    )
+
+    const elapsed = Date.now() - startedAt
+    expect(elapsed).toBeLessThan(20_000)
+  }, 30_000)
+
+  test("lifecycle soak: repeated create-execute-close cycles stay stable", async () => {
+    const runs = Array.from({ length: 30 }, (_, i) => i)
+
+    await Effect.runPromise(
+      Effect.gen(function*() {
+        const factory = yield* SandboxFactory
+
+        yield* Effect.forEach(runs, (index) =>
+          Effect.gen(function*() {
+            const scope = yield* Scope.make()
+            const sandbox = yield* factory.create({ callId: `soak-${index}` as CallId, depth: 0 }).pipe(
+              Effect.provideService(Scope.Scope, scope)
+            )
+
+            const output = yield* sandbox.execute(`print(${index})`)
+            expect(output).toBe(String(index))
+
+            yield* Scope.close(scope, Exit.void)
+          }),
+          { discard: true }
+        )
+      }).pipe(Effect.provide(makeTestLayer()))
+    )
+  }, 30_000)
 })

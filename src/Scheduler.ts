@@ -553,6 +553,17 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       )
     })
 
+  const failRemainingBridgeDeferreds = () =>
+    Effect.gen(function*() {
+      const remainingBridgePending = yield* Ref.getAndSet(runtime.bridgePending, new Map())
+      if (remainingBridgePending.size === 0) return
+
+      yield* Effect.forEach([...remainingBridgePending.values()], (deferred) =>
+        Deferred.fail(deferred, new SandboxError({ message: "Scheduler stopped before bridge response" })),
+        { discard: true }
+      )
+    })
+
   const runLoop = Effect.gen(function*() {
     yield* enqueue(RlmCommand.StartCall({
       callId: rootCallId,
@@ -579,6 +590,12 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
   })
 
   return yield* runLoop.pipe(
-    Effect.onExit((exit) => closeRemainingCallScopes(exit))
+    Effect.onExit((exit) =>
+      Effect.gen(function*() {
+        yield* Queue.shutdown(runtime.commands).pipe(Effect.ignore)
+        yield* failRemainingBridgeDeferreds()
+        yield* closeRemainingCallScopes(exit)
+      })
+    )
   )
 })

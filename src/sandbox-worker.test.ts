@@ -287,6 +287,38 @@ describe("sandbox-worker", () => {
     expect(String(result.message)).toContain("Strict sandbox blocks dynamic module loading")
   })
 
+  test("strict mode blocks constructor escape patterns", async () => {
+    handle = spawnWorker()
+    handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0, sandboxMode: "strict" })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "strict-no-constructor-escape",
+      code: "print(({}).constructor.constructor('return process.cwd()')())"
+    })
+
+    const result = await handle.waitForMessage()
+    expect(result._tag).toBe("ExecError")
+    expect(String(result.message)).toContain("Strict sandbox blocks constructor escape")
+  })
+
+  test("strict mode blocks Function constructor", async () => {
+    handle = spawnWorker()
+    handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0, sandboxMode: "strict" })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "strict-no-function-constructor",
+      code: "print(Function('return 1')())"
+    })
+
+    const result = await handle.waitForMessage()
+    expect(result._tag).toBe("ExecError")
+    expect(String(result.message)).toContain("Strict sandbox blocks Function constructor")
+  })
+
   test("strict mode hides ambient globals", async () => {
     handle = spawnWorker()
     handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0, sandboxMode: "strict" })
