@@ -7,7 +7,7 @@ import { SandboxFactory } from "./Sandbox"
 import { RlmRuntime, RlmRuntimeLive } from "./Runtime"
 import { BridgeRequestId, CallId, RlmCommand } from "./RlmTypes"
 import { runScheduler } from "./Scheduler"
-import { makeFakeLanguageModelClientLayer, type FakeModelMetrics } from "./testing/FakeLanguageModelClient"
+import { makeFakeRlmModelLayer, type FakeModelMetrics } from "./testing/FakeRlmModel"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./testing/FakeSandboxFactory"
 
 const defaultConfig: RlmConfigService = {
@@ -26,7 +26,7 @@ const makeLayers = (options: {
   readonly sandboxMetrics?: FakeSandboxMetrics
   readonly config?: Partial<RlmConfigService>
 }) => {
-  const model = makeFakeLanguageModelClientLayer(options.responses, options.modelMetrics)
+  const model = makeFakeRlmModelLayer(options.responses, options.modelMetrics)
   const sandbox = makeFakeSandboxFactoryLayer(options.sandboxMetrics)
   const runtimeLayer = Layer.fresh(RlmRuntimeLive)
   const base = Layer.mergeAll(model, sandbox, runtimeLayer)
@@ -42,7 +42,7 @@ describe("Scheduler integration", () => {
       executeCalls: 0,
       snippets: []
     }
-    const modelMetrics: FakeModelMetrics = { calls: 0, requests: [] }
+    const modelMetrics: FakeModelMetrics = { calls: 0, prompts: [], depths: [] }
 
     const answer = await Effect.runPromise(
       complete({
@@ -77,11 +77,16 @@ describe("Scheduler integration", () => {
     // Model called twice: once for code gen, once for final
     expect(modelMetrics.calls).toBe(2)
 
-    // Second model call should include execution output in transcript
-    const secondRequest = modelMetrics.requests[1]!
-    expect(secondRequest.transcript).toHaveLength(1)
-    expect(secondRequest.transcript[0]).toContain("[Execution Output]")
-    expect(secondRequest.transcript[0]).toContain("executed:14") // FakeSandbox returns executed:{length}
+    // Second model call should include execution output in prompt messages
+    const secondPrompt = modelMetrics.prompts[1]!
+    const userMessages = secondPrompt.content.filter((m) => m.role === "user")
+    // Last user message should contain execution output
+    const lastUserMsg = userMessages[userMessages.length - 1]!
+    const lastUserText = lastUserMsg.role === "user"
+      ? (lastUserMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(lastUserText).toContain("[Execution Output]")
+    expect(lastUserText).toContain("executed:14") // FakeSandbox returns executed:{length}
   })
 
   test("FINAL extraction: model returns FINAL → immediate finalization (no sandbox execution)", async () => {
@@ -116,7 +121,7 @@ describe("Scheduler integration", () => {
   })
 
   test("no code block and no FINAL → loops to next GenerateStep", async () => {
-    const modelMetrics: FakeModelMetrics = { calls: 0, requests: [] }
+    const modelMetrics: FakeModelMetrics = { calls: 0, prompts: [], depths: [] }
     const sandboxMetrics: FakeSandboxMetrics = {
       createCalls: 0,
       executeCalls: 0,
@@ -220,7 +225,7 @@ describe("Scheduler integration", () => {
   })
 
   test("existing tests still pass: returns final answer from scripted model", async () => {
-    const modelMetrics: FakeModelMetrics = { calls: 0, requests: [] }
+    const modelMetrics: FakeModelMetrics = { calls: 0, prompts: [], depths: [] }
     const sandboxMetrics: FakeSandboxMetrics = {
       createCalls: 0,
       executeCalls: 0,
@@ -327,7 +332,7 @@ describe("Scheduler integration", () => {
     )
 
     const layers = Layer.mergeAll(
-      makeFakeLanguageModelClientLayer([{ text: "```js\nprint('hanging')\n```" }]),
+      makeFakeRlmModelLayer([{ text: "```js\nprint('hanging')\n```" }]),
       hangingSandboxLayer,
       Layer.fresh(RlmRuntimeLive)
     )
@@ -384,7 +389,7 @@ describe("Scheduler integration", () => {
       })
     )
 
-    const model = makeFakeLanguageModelClientLayer(
+    const model = makeFakeRlmModelLayer(
       [{ text: "FINAL(\"unreachable\")" }]
     )
 

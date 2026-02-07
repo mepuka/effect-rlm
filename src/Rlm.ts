@@ -1,6 +1,6 @@
 import { Context, Effect, Layer, PubSub, Stream } from "effect"
 import { BridgeHandlerLive } from "./BridgeHandler"
-import { LanguageModelClient } from "./LanguageModelClient"
+import { RlmModel } from "./RlmModel"
 import type { RlmError } from "./RlmError"
 import { RlmRuntime, RlmRuntimeLive } from "./Runtime"
 import { CallId, RlmEvent } from "./RlmTypes"
@@ -59,14 +59,14 @@ export class Rlm extends Context.Tag("@recursive-llm/Rlm")<
   RlmService
 >() {}
 
-export const rlmLayer: Layer.Layer<Rlm, never, LanguageModelClient | SandboxFactory> = Layer.effect(
+export const rlmLayer: Layer.Layer<Rlm, never, RlmModel | SandboxFactory> = Layer.effect(
   Rlm,
   Effect.gen(function*() {
-    const languageModelClient = yield* LanguageModelClient
+    const rlmModel = yield* RlmModel
     const sandboxFactory = yield* SandboxFactory
 
     const dependencies = Layer.mergeAll(
-      Layer.succeed(LanguageModelClient, languageModelClient),
+      Layer.succeed(RlmModel, rlmModel),
       Layer.succeed(SandboxFactory, sandboxFactory)
     )
 
@@ -83,13 +83,13 @@ export const rlmLayer: Layer.Layer<Rlm, never, LanguageModelClient | SandboxFact
   })
 )
 
-export const rlmBunLayer: Layer.Layer<Rlm, never, LanguageModelClient> = Layer.effect(
+export const rlmBunLayer: Layer.Layer<Rlm, never, RlmModel> = Layer.effect(
   Rlm,
   Effect.gen(function*() {
-    const languageModelClient = yield* LanguageModelClient
+    const rlmModel = yield* RlmModel
 
     // Shared dependency (not per-call)
-    const lmcLayer = Layer.succeed(LanguageModelClient, languageModelClient)
+    const rlmModelLayer = Layer.succeed(RlmModel, rlmModel)
 
     // Per-call layer constructor: fresh RlmRuntime → BridgeHandler → SandboxFactory
     const makePerCallDeps = () => {
@@ -99,7 +99,7 @@ export const rlmBunLayer: Layer.Layer<Rlm, never, LanguageModelClient> = Layer.e
           Layer.provideMerge(BridgeHandlerLive, RlmRuntimeLive)
         )
       )
-      return Layer.provideMerge(perCallLayer, lmcLayer)
+      return Layer.provideMerge(perCallLayer, rlmModelLayer)
     }
 
     return Rlm.of({

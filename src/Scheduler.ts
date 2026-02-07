@@ -1,14 +1,16 @@
 import { Deferred, Effect, Exit, Option, PubSub, Queue, Ref, Scope, Stream } from "effect"
 import { consumeIteration, recordTokens, reserveLlmCall, snapshot, withLlmPermit } from "./Budget"
 import { extractCodeBlock, extractFinal } from "./CodeExtractor"
-import { LanguageModelClient } from "./LanguageModelClient"
 import { RlmConfig } from "./RlmConfig"
+import { RlmModel } from "./RlmModel"
 import {
   NoFinalAnswerError,
   SandboxError,
   UnknownRlmError,
   type RlmError
 } from "./RlmError"
+import { buildReplPrompt, buildOneShotPrompt, truncateOutput, CONTEXT_PREVIEW_CHARS } from "./RlmPrompt"
+import { buildReplSystemPrompt, buildOneShotSystemPrompt } from "./SystemPrompt"
 import { SandboxFactory } from "./Sandbox"
 import { RlmRuntime } from "./Runtime"
 import { BridgeRequestId, CallId, CallState, RlmCommand, RlmEvent, TranscriptEntry } from "./RlmTypes"
@@ -147,7 +149,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
   const rootDepth = options.depth ?? 0
 
   const config = yield* RlmConfig
-  const model = yield* LanguageModelClient
+  const rlmModel = yield* RlmModel
   const sandboxFactory = yield* SandboxFactory
 
   const resultDeferred = yield* Deferred.make<string, RlmError>()
@@ -235,36 +237,51 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
 
       yield* reserveLlmCall(callState.callId)
 
-      const response = yield* withLlmPermit(
-        model.generate({
-          query: callState.query,
-          context: callState.context,
+      const prompt = buildReplPrompt({
+        systemPrompt: buildReplSystemPrompt({
           depth: callState.depth,
           iteration: callState.iteration + 1,
-          transcript: callState.transcript.map((entry) =>
-            entry.executionOutput
-              ? `${entry.assistantResponse}\n\n[Execution Output]\n${entry.executionOutput}`
-              : entry.assistantResponse
-          )
-        })
+          maxIterations: config.maxIterations,
+          maxDepth: config.maxDepth,
+          budget: {
+            iterationsRemaining: budget.iterationsRemaining,
+            llmCallsRemaining: budget.llmCallsRemaining
+          }
+        }),
+        query: callState.query,
+        contextLength: callState.context.length,
+        contextPreview: callState.context.slice(0, CONTEXT_PREVIEW_CHARS),
+        transcript: callState.transcript
+      })
+      const response = yield* withLlmPermit(
+        rlmModel.generateText({ prompt, depth: callState.depth })
       )
 
-      yield* recordTokens(callState.callId, response.totalTokens)
+      yield* recordTokens(callState.callId, response.usage.totalTokens)
 
-      const modelEvent = response.totalTokens === undefined
-        ? RlmEvent.ModelResponse({
-          completionId: runtime.completionId,
-          callId: callState.callId,
-          depth: callState.depth,
-          text: response.text
-        })
-        : RlmEvent.ModelResponse({
-          completionId: runtime.completionId,
-          callId: callState.callId,
-          depth: callState.depth,
-          text: response.text,
-          usage: { totalTokens: response.totalTokens }
-        })
+      const modelEvent = RlmEvent.ModelResponse({
+        completionId: runtime.completionId,
+        callId: callState.callId,
+        depth: callState.depth,
+        text: response.text,
+        usage: {
+          ...(response.usage.inputTokens !== undefined
+            ? { inputTokens: response.usage.inputTokens }
+            : {}),
+          ...(response.usage.outputTokens !== undefined
+            ? { outputTokens: response.usage.outputTokens }
+            : {}),
+          ...(response.usage.totalTokens !== undefined
+            ? { totalTokens: response.usage.totalTokens }
+            : {}),
+          ...(response.usage.reasoningTokens !== undefined
+            ? { reasoningTokens: response.usage.reasoningTokens }
+            : {}),
+          ...(response.usage.cachedInputTokens !== undefined
+            ? { cachedInputTokens: response.usage.cachedInputTokens }
+            : {})
+        }
+      })
 
       yield* publishEvent(modelEvent)
 
@@ -364,13 +381,13 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         output: command.output
       }))
 
-      // Update last transcript entry with execution output
+      // Update last transcript entry with (truncated) execution output
       const transcript = [...callState.transcript]
       const last = transcript[transcript.length - 1]
       if (last) {
         transcript[transcript.length - 1] = new TranscriptEntry({
           ...last,
-          executionOutput: command.output
+          executionOutput: truncateOutput(command.output)
         })
       }
 
@@ -404,20 +421,19 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       }))
 
       if (callState.depth >= config.maxDepth) {
-        // At max depth: direct model call with budget reservation
+        // At max depth: one-shot model call (no REPL protocol) with budget reservation
         yield* Effect.forkIn(
           Effect.gen(function*() {
             yield* reserveLlmCall(command.callId)
+            const oneShotPrompt = buildOneShotPrompt({
+              systemPrompt: buildOneShotSystemPrompt(),
+              query: String(command.args[0]),
+              context: String(command.args[1] ?? "")
+            })
             const response = yield* withLlmPermit(
-              model.generate({
-                query: String(command.args[0]),
-                context: String(command.args[1] ?? ""),
-                depth: callState.depth + 1,
-                iteration: 1,
-                transcript: []
-              })
+              rlmModel.generateText({ prompt: oneShotPrompt, depth: callState.depth + 1 })
             )
-            yield* recordTokens(command.callId, response.totalTokens)
+            yield* recordTokens(command.callId, response.usage.totalTokens)
             yield* resolveBridgeDeferred(command.bridgeRequestId, response.text)
           }).pipe(
             Effect.catchAll((error) =>

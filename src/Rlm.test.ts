@@ -4,7 +4,7 @@ import { complete, stream } from "./Rlm"
 import { RlmConfig, type RlmConfigService } from "./RlmConfig"
 import { BudgetExhaustedError } from "./RlmError"
 import { RlmRuntimeLive } from "./Runtime"
-import { makeFakeLanguageModelClientLayer, type FakeModelMetrics } from "./testing/FakeLanguageModelClient"
+import { makeFakeRlmModelLayer, type FakeModelMetrics } from "./testing/FakeRlmModel"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./testing/FakeSandboxFactory"
 
 const defaultConfig: RlmConfigService = {
@@ -23,7 +23,7 @@ const makeLayers = (options: {
   readonly sandboxMetrics?: FakeSandboxMetrics
   readonly config?: Partial<RlmConfigService>
 }) => {
-  const model = makeFakeLanguageModelClientLayer(options.responses, options.modelMetrics)
+  const model = makeFakeRlmModelLayer(options.responses, options.modelMetrics)
   const sandbox = makeFakeSandboxFactoryLayer(options.sandboxMetrics)
   const runtimeLayer = Layer.fresh(RlmRuntimeLive)
   const base = Layer.mergeAll(model, sandbox, runtimeLayer)
@@ -34,7 +34,7 @@ const makeLayers = (options: {
 
 describe("Rlm thin slice", () => {
   test("returns final answer from scripted model", async () => {
-    const modelMetrics: FakeModelMetrics = { calls: 0, requests: [] }
+    const modelMetrics: FakeModelMetrics = { calls: 0, prompts: [], depths: [] }
     const sandboxMetrics: FakeSandboxMetrics = {
       createCalls: 0,
       executeCalls: 0,
@@ -66,7 +66,7 @@ describe("Rlm thin slice", () => {
   })
 
   test("reserves llm budget before model invocation", async () => {
-    const modelMetrics: FakeModelMetrics = { calls: 0, requests: [] }
+    const modelMetrics: FakeModelMetrics = { calls: 0, prompts: [], depths: [] }
 
     const result = await Effect.runPromise(
       complete({

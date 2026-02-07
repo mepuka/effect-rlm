@@ -73,7 +73,13 @@ export type RlmEvent = Data.TaggedEnum<{
     readonly callId: CallId
     readonly depth: number
     readonly text: string
-    readonly usage?: { readonly totalTokens?: number }
+    readonly usage?: {
+      readonly inputTokens?: number
+      readonly outputTokens?: number
+      readonly totalTokens?: number
+      readonly reasoningTokens?: number
+      readonly cachedInputTokens?: number
+    }
   }
   CallFinalized: {
     readonly completionId: string

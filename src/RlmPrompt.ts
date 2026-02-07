@@ -1,0 +1,59 @@
+import * as Prompt from "@effect/ai/Prompt"
+import type { TranscriptEntry } from "./RlmTypes"
+
+export const MAX_OUTPUT_CHARS = 4_000
+export const CONTEXT_PREVIEW_CHARS = 200
+export const MAX_ONESHOT_CONTEXT_CHARS = 8_000
+
+export const truncateOutput = (output: string, maxChars = MAX_OUTPUT_CHARS): string => {
+  if (output.length <= maxChars) return output
+  return output.slice(0, maxChars) + `\n[truncated at ${output.length} chars]`
+}
+
+export interface BuildReplPromptOptions {
+  readonly systemPrompt: string
+  readonly query: string
+  readonly contextLength: number
+  readonly contextPreview: string
+  readonly transcript: ReadonlyArray<TranscriptEntry>
+}
+
+export const buildReplPrompt = (options: BuildReplPromptOptions): Prompt.Prompt => {
+  const messages: Array<Prompt.MessageEncoded> = []
+
+  messages.push({ role: "system", content: options.systemPrompt })
+
+  const userContent = options.contextLength > 0
+    ? `${options.query}\n\n[Context available in __vars.context (${options.contextLength} chars). Preview: ${options.contextPreview}...]`
+    : options.query
+  messages.push({ role: "user", content: userContent })
+
+  for (const entry of options.transcript) {
+    messages.push({ role: "assistant", content: entry.assistantResponse })
+    if (entry.executionOutput !== undefined) {
+      messages.push({
+        role: "user",
+        content: `[Execution Output]\n${entry.executionOutput}`
+      })
+    }
+  }
+
+  return Prompt.make(messages)
+}
+
+export interface BuildOneShotPromptOptions {
+  readonly systemPrompt: string
+  readonly query: string
+  readonly context: string
+}
+
+export const buildOneShotPrompt = (options: BuildOneShotPromptOptions): Prompt.Prompt => {
+  const messages: Array<Prompt.MessageEncoded> = []
+  messages.push({ role: "system", content: options.systemPrompt })
+  const boundedContext = truncateOutput(options.context, MAX_ONESHOT_CONTEXT_CHARS)
+  const userContent = boundedContext
+    ? `${options.query}\n\nContext: ${boundedContext}`
+    : options.query
+  messages.push({ role: "user", content: userContent })
+  return Prompt.make(messages)
+}
