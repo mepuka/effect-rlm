@@ -12,6 +12,7 @@ import { runScheduler } from "../src/Scheduler"
 import * as RlmTool from "../src/RlmTool"
 import { makeFakeRlmModelLayer, type FakeModelMetrics } from "./helpers/FakeRlmModel"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./helpers/FakeSandboxFactory"
+import { makeCustomSandboxFactoryLayer } from "./helpers/CustomSandboxFactory"
 
 const defaultConfig: RlmConfigService = {
   maxIterations: 10,
@@ -258,10 +259,10 @@ describe("Scheduler integration", () => {
     expect(sandboxMetrics.createCalls).toBe(1)
   })
 
-  test("budget enforcement on iterations during code execution loop", async () => {
+  test("extract fallback when max iterations exhausted", async () => {
     const result = await Effect.runPromise(
       complete({
-        query: "loop forever",
+        query: "compute",
         context: "ctx"
       }).pipe(
         Effect.either,
@@ -270,10 +271,60 @@ describe("Scheduler integration", () => {
             responses: [
               { text: "```js\nstep1()\n```" },
               { text: "```js\nstep2()\n```" },
-              // Would need a 3rd iteration but maxIterations=2
-              { text: "FINAL(\"unreachable\")" }
+              { text: 'FINAL("extracted")' }  // extract fallback response
             ],
             config: { maxIterations: 2 }
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("extracted")
+    }
+  })
+
+  test("extract fallback uses raw text when no FINAL in response", async () => {
+    const result = await Effect.runPromise(
+      complete({
+        query: "compute",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              { text: "```js\nstep1()\n```" },
+              { text: "```js\nstep2()\n```" },
+              { text: "The answer is 42" }  // extract response without FINAL
+            ],
+            config: { maxIterations: 2 }
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("The answer is 42")
+    }
+  })
+
+  test("extract fallback fails when LLM call budget also exhausted", async () => {
+    const result = await Effect.runPromise(
+      complete({
+        query: "compute",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              { text: "```js\nstep1()\n```" },
+              { text: 'FINAL("unreachable")' }
+            ],
+            config: { maxIterations: 1, maxLlmCalls: 1 }
           })
         )
       )
@@ -381,6 +432,198 @@ describe("Scheduler integration", () => {
       expect(result.leakedBridgeResult.left.message).toContain("Scheduler stopped")
     }
     expect(Exit.isFailure(result.offerAfterShutdown)).toBe(true)
+  })
+
+  test("execution error surfaces as output and model can recover", async () => {
+    const metrics = { createCalls: 0, executeCalls: 0, snippets: [] as Array<string> }
+    const failOnceSandboxLayer = makeCustomSandboxFactoryLayer({
+      metrics,
+      execute: (code, callNumber) =>
+        callNumber === 1
+          ? Effect.fail(new SandboxError({ message: "ReferenceError: x is not defined" }))
+          : Effect.succeed(`executed:${code.length}`)
+    })
+
+    const modelMetrics: FakeModelMetrics = { calls: 0, prompts: [], depths: [] }
+    const model = makeFakeRlmModelLayer([
+      { text: "```js\nlet y = x + 1\n```" },
+      { text: "```js\nlet y = 1 + 1\n```" },
+      { text: 'FINAL("recovered")' }
+    ], modelMetrics)
+
+    const layers = Layer.mergeAll(model, failOnceSandboxLayer, Layer.fresh(RlmRuntimeLive))
+
+    const result = await Effect.runPromise(
+      complete({ query: "compute", context: "ctx" }).pipe(
+        Effect.either,
+        Effect.provide(layers)
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("recovered")
+    }
+    expect(metrics.executeCalls).toBe(2)
+  })
+
+  test("repeated execution errors consume iterations until extract fallback", async () => {
+    const alwaysFailSandboxLayer = makeCustomSandboxFactoryLayer({
+      execute: () => Effect.fail(new SandboxError({ message: "always fails" }))
+    })
+
+    const model = makeFakeRlmModelLayer([
+      { text: "```js\nfail()\n```" },
+      { text: "```js\nfail()\n```" },
+      { text: 'FINAL("extracted")' }
+    ])
+
+    const layers = Layer.provide(
+      Layer.mergeAll(model, alwaysFailSandboxLayer, Layer.fresh(RlmRuntimeLive)),
+      Layer.succeed(RlmConfig, { ...defaultConfig, maxIterations: 2 })
+    )
+
+    const result = await Effect.runPromise(
+      complete({ query: "compute", context: "ctx" }).pipe(
+        Effect.either,
+        Effect.provide(layers)
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("extracted")
+    }
+  })
+
+  test("error message appears in subsequent model prompt", async () => {
+    const metrics = { createCalls: 0, executeCalls: 0, snippets: [] as Array<string> }
+    const failOnceSandboxLayer = makeCustomSandboxFactoryLayer({
+      metrics,
+      execute: (code, callNumber) =>
+        callNumber === 1
+          ? Effect.fail(new SandboxError({ message: "ReferenceError: x is not defined" }))
+          : Effect.succeed(`executed:${code.length}`)
+    })
+
+    const modelMetrics: FakeModelMetrics = { calls: 0, prompts: [], depths: [] }
+    const model = makeFakeRlmModelLayer([
+      { text: "```js\nlet y = x + 1\n```" },
+      { text: "```js\nlet y = 1 + 1\n```" },
+      { text: 'FINAL("ok")' }
+    ], modelMetrics)
+
+    const layers = Layer.mergeAll(model, failOnceSandboxLayer, Layer.fresh(RlmRuntimeLive))
+
+    await Effect.runPromise(
+      complete({ query: "compute", context: "ctx" }).pipe(
+        Effect.either,
+        Effect.provide(layers)
+      )
+    )
+
+    // Second model call should see the error in its prompt
+    const secondPrompt = modelMetrics.prompts[1]!
+    const userMessages = secondPrompt.content.filter((m) => m.role === "user")
+    const lastUserMsg = userMessages[userMessages.length - 1]!
+    const lastUserText = lastUserMsg.role === "user"
+      ? (lastUserMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(lastUserText).toContain("Error: ReferenceError: x is not defined")
+  })
+
+  test("error-path emits CodeExecutionStarted + CodeExecutionCompleted", async () => {
+    const failOnceSandboxLayer = makeCustomSandboxFactoryLayer({
+      execute: (code, callNumber) =>
+        callNumber === 1
+          ? Effect.fail(new SandboxError({ message: "boom" }))
+          : Effect.succeed(`executed:${code.length}`)
+    })
+
+    const model = makeFakeRlmModelLayer([
+      { text: "```js\nbad()\n```" },
+      { text: "```js\ngood()\n```" },
+      { text: 'FINAL("ok")' }
+    ])
+
+    const layers = Layer.mergeAll(model, failOnceSandboxLayer, Layer.fresh(RlmRuntimeLive))
+
+    const events = await Effect.runPromise(
+      stream({ query: "compute", context: "ctx" }).pipe(
+        Stream.runCollect,
+        Effect.provide(layers)
+      )
+    )
+
+    const eventTags = Chunk.toReadonlyArray(events).map((e) => e._tag)
+
+    // First iteration: code → error surfaced as CodeExecuted
+    // Second iteration: code → success
+    // Third iteration: FINAL
+    expect(eventTags).toEqual([
+      "CallStarted",
+      "IterationStarted",
+      "ModelResponse",
+      "CodeExecutionStarted",
+      "CodeExecutionCompleted",  // error output
+      "IterationStarted",
+      "ModelResponse",
+      "CodeExecutionStarted",
+      "CodeExecutionCompleted",  // success output
+      "IterationStarted",
+      "ModelResponse",
+      "CallFinalized"
+    ])
+
+    // Verify the first CodeExecutionCompleted contains the error
+    const execCompletedEvents = Chunk.toReadonlyArray(events).filter(
+      (e): e is Extract<typeof e, { _tag: "CodeExecutionCompleted" }> =>
+        e._tag === "CodeExecutionCompleted"
+    )
+    expect(execCompletedEvents[0]!.output).toContain("Error: boom")
+  })
+
+  test("primitive execution errors do not stall and surface as deterministic output", async () => {
+    const modelMetrics: FakeModelMetrics = { calls: 0, prompts: [], depths: [] }
+    const primitiveFailOnceSandboxLayer = makeCustomSandboxFactoryLayer({
+      execute: (code, callNumber) =>
+        callNumber === 1
+          ? Effect.fail("boom")
+          : Effect.succeed(`executed:${code.length}`)
+    })
+
+    const model = makeFakeRlmModelLayer([
+      { text: "```js\nlet y = x + 1\n```" },
+      { text: "```js\nlet y = 1 + 1\n```" },
+      { text: 'FINAL("ok")' }
+    ], modelMetrics)
+
+    const layers = Layer.mergeAll(model, primitiveFailOnceSandboxLayer, Layer.fresh(RlmRuntimeLive))
+
+    const result = await Effect.runPromise(
+      complete({ query: "compute", context: "ctx" }).pipe(
+        Effect.either,
+        Effect.provide(layers),
+        Effect.timeoutOption("5 seconds")
+      )
+    )
+
+    expect(Option.isSome(result)).toBe(true)
+    if (Option.isSome(result)) {
+      expect(result.value._tag).toBe("Right")
+      if (result.value._tag === "Right") {
+        expect(result.value.right).toBe("ok")
+      }
+    }
+
+    // Second model call should see primitive failure text as execution output.
+    const secondPrompt = modelMetrics.prompts[1]!
+    const userMessages = secondPrompt.content.filter((m) => m.role === "user")
+    const lastUserMsg = userMessages[userMessages.length - 1]!
+    const lastUserText = lastUserMsg.role === "user"
+      ? (lastUserMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(lastUserText).toContain("Error: boom")
   })
 
   test("StartCall failure with failing sandbox factory does not hang", async () => {

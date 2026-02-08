@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { buildReplSystemPrompt, buildOneShotSystemPrompt } from "../src/SystemPrompt"
+import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildExtractSystemPrompt } from "../src/SystemPrompt"
 
 describe("SystemPrompt", () => {
   const baseOptions = {
@@ -104,5 +104,131 @@ describe("SystemPrompt", () => {
     })
     expect(prompt).not.toContain("## Available Tools")
     expect(prompt).not.toContain("search")
+  })
+
+  test("REPL prompt contains EXPLORE FIRST rule", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("EXPLORE FIRST")
+  })
+
+  test("REPL prompt contains ITERATE rule", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("ITERATE")
+  })
+
+  test("REPL prompt contains VERIFY BEFORE SUBMITTING rule", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("VERIFY BEFORE SUBMITTING")
+  })
+
+  test("REPL prompt contains MINIMIZE RETYPING rule", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("MINIMIZE RETYPING")
+  })
+
+  test("REPL prompt contains scope semantics: local variables do NOT survive", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("local variables")
+    expect(prompt).toContain("do NOT survive")
+  })
+
+  test("REPL prompt contains __vars.results example", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("__vars.results")
+  })
+
+  test("REPL prompt contains __vars.context.slice example", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("__vars.context.slice")
+  })
+
+  test("REPL prompt contains ALWAYS use print()", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("ALWAYS use `print()`")
+  })
+
+  test("REPL prompt contains MUST have seen execution output", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("MUST have seen execution output")
+  })
+
+  test("REPL prompt contains HANDLE ERRORS rule", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("HANDLE ERRORS")
+  })
+
+  test("REPL prompt contains do not paste context text", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("Do not paste context text")
+  })
+
+  test("REPL prompt contains [object Promise] warning when canRecurse", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
+    expect(prompt).toContain("[object Promise]")
+  })
+
+  test("last iteration (iterationsRemaining: 0) contains LAST iteration warning", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      budget: { iterationsRemaining: 0, llmCallsRemaining: 19 }
+    })
+    expect(prompt).toContain("LAST iteration")
+  })
+
+  test("penultimate iteration (iterationsRemaining: 1) does NOT contain LAST iteration warning", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      budget: { iterationsRemaining: 1, llmCallsRemaining: 19 }
+    })
+    expect(prompt).not.toContain("LAST iteration")
+  })
+
+  test("REPL prompt warns about console.log", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("console.log")
+    expect(prompt).toContain("stderr")
+  })
+
+  test("REPL prompt mentions await for llm_query", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
+    expect(prompt).toContain("await llm_query")
+  })
+
+  test("tool usage includes await requirement", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      tools: [{
+        name: "fetch",
+        description: "Fetch a URL",
+        parameterNames: ["url"],
+        parametersJsonSchema: { type: "object" },
+        returnsJsonSchema: { type: "string" }
+      }]
+    })
+    expect(prompt).toContain("(requires await)")
+  })
+})
+
+describe("buildExtractSystemPrompt", () => {
+  test("returns FINAL instruction", () => {
+    const prompt = buildExtractSystemPrompt()
+    expect(prompt).toContain("FINAL")
+    expect(prompt).toContain("ran out of iterations")
+    expect(prompt).toContain('FINAL("your answer")')
+  })
+
+  test("includes JSON schema when provided", () => {
+    const schema = { type: "object", properties: { result: { type: "number" } } }
+    const prompt = buildExtractSystemPrompt(schema)
+    expect(prompt).toContain("valid JSON matching this schema")
+    expect(prompt).toContain('"result"')
+    expect(prompt).toContain("FINAL(`{...}`)")
+    expect(prompt).toContain("not escaped")
+    expect(prompt).not.toContain('FINAL("your answer")')
+  })
+
+  test("omits schema section when not provided", () => {
+    const prompt = buildExtractSystemPrompt()
+    expect(prompt).not.toContain("valid JSON matching this schema")
   })
 })

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import {
   buildReplPrompt,
   buildOneShotPrompt,
+  buildExtractPrompt,
   truncateOutput,
   MAX_OUTPUT_CHARS,
   MAX_ONESHOT_CONTEXT_CHARS
@@ -162,6 +163,176 @@ describe("buildOneShotPrompt", () => {
     })
     const textContent = prompt.content[1]!.role === "user"
       ? (prompt.content[1]!.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(textContent).toBe("hello")
+  })
+})
+
+describe("buildReplPrompt iteration-0 safeguard", () => {
+  test("empty transcript + context > 0 → user message starts with safeguard", () => {
+    const prompt = buildReplPrompt({
+      systemPrompt: "system",
+      query: "summarize",
+      contextLength: 5000,
+      contextPreview: "The quick brown fox",
+      transcript: []
+    })
+    const userMsg = prompt.content[1]!
+    const textContent = userMsg.role === "user"
+      ? (userMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(textContent).toContain("You have not seen the context yet")
+  })
+
+  test("empty transcript + context = 0 → no safeguard", () => {
+    const prompt = buildReplPrompt({
+      systemPrompt: "system",
+      query: "just answer",
+      contextLength: 0,
+      contextPreview: "",
+      transcript: []
+    })
+    const userMsg = prompt.content[1]!
+    const textContent = userMsg.role === "user"
+      ? (userMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(textContent).not.toContain("You have not seen the context yet")
+  })
+
+  test("non-empty transcript + context > 0 → no safeguard", () => {
+    const prompt = buildReplPrompt({
+      systemPrompt: "system",
+      query: "summarize",
+      contextLength: 5000,
+      contextPreview: "The quick brown fox",
+      transcript: [
+        new TranscriptEntry({
+          assistantResponse: "```js\nprint(__vars.context.length)\n```",
+          executionOutput: "5000"
+        })
+      ]
+    })
+    // Check the initial user message (index 1), not the execution output message
+    const userMsg = prompt.content[1]!
+    const textContent = userMsg.role === "user"
+      ? (userMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(textContent).not.toContain("You have not seen the context yet")
+  })
+})
+
+describe("buildReplPrompt empty output hint", () => {
+  test("empty executionOutput shows hint", () => {
+    const prompt = buildReplPrompt({
+      systemPrompt: "system",
+      query: "q",
+      contextLength: 0,
+      contextPreview: "",
+      transcript: [
+        new TranscriptEntry({
+          assistantResponse: "```js\nfoo()\n```",
+          executionOutput: ""
+        })
+      ]
+    })
+    const lastMsg = prompt.content[3]!
+    const textContent = lastMsg.role === "user"
+      ? (lastMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(textContent).toContain("(no output — did you forget to print?)")
+  })
+
+  test("non-empty executionOutput passes through", () => {
+    const prompt = buildReplPrompt({
+      systemPrompt: "system",
+      query: "q",
+      contextLength: 0,
+      contextPreview: "",
+      transcript: [
+        new TranscriptEntry({
+          assistantResponse: "code",
+          executionOutput: "42"
+        })
+      ]
+    })
+    const lastMsg = prompt.content[3]!
+    const textContent = lastMsg.role === "user"
+      ? (lastMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(textContent).toContain("42")
+    expect(textContent).not.toContain("did you forget to print")
+  })
+})
+
+describe("buildExtractPrompt", () => {
+  test("produces correct message sequence with transcript", () => {
+    const prompt = buildExtractPrompt({
+      systemPrompt: "Extract the answer.",
+      query: "What is 2+2?",
+      contextLength: 100,
+      contextPreview: "math context",
+      transcript: [
+        new TranscriptEntry({
+          assistantResponse: "```js\nprint(2+2)\n```",
+          executionOutput: "4"
+        })
+      ]
+    })
+    // system + user + assistant + user(output) = 4 messages
+    expect(prompt.content).toHaveLength(4)
+    expect(prompt.content[0]!.role).toBe("system")
+    expect(prompt.content[1]!.role).toBe("user")
+    expect(prompt.content[2]!.role).toBe("assistant")
+    expect(prompt.content[3]!.role).toBe("user")
+  })
+
+  test("user message says 'Context was available' (past tense)", () => {
+    const prompt = buildExtractPrompt({
+      systemPrompt: "system",
+      query: "summarize",
+      contextLength: 500,
+      contextPreview: "preview text",
+      transcript: []
+    })
+    const userMsg = prompt.content[1]!
+    const textContent = userMsg.role === "user"
+      ? (userMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(textContent).toContain("Context was available")
+    expect(textContent).toContain("500 chars")
+  })
+
+  test("empty output shows '(no output)' hint", () => {
+    const prompt = buildExtractPrompt({
+      systemPrompt: "system",
+      query: "q",
+      contextLength: 0,
+      contextPreview: "",
+      transcript: [
+        new TranscriptEntry({
+          assistantResponse: "code",
+          executionOutput: ""
+        })
+      ]
+    })
+    const lastMsg = prompt.content[3]!
+    const textContent = lastMsg.role === "user"
+      ? (lastMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(textContent).toContain("(no output)")
+  })
+
+  test("no context → query only in user message", () => {
+    const prompt = buildExtractPrompt({
+      systemPrompt: "system",
+      query: "hello",
+      contextLength: 0,
+      contextPreview: "",
+      transcript: []
+    })
+    const userMsg = prompt.content[1]!
+    const textContent = userMsg.role === "user"
+      ? (userMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
       : ""
     expect(textContent).toBe("hello")
   })

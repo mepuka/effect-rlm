@@ -9,8 +9,8 @@ import {
   UnknownRlmError,
   type RlmError
 } from "./RlmError"
-import { buildReplPrompt, buildOneShotPrompt, truncateOutput, CONTEXT_PREVIEW_CHARS } from "./RlmPrompt"
-import { buildReplSystemPrompt, buildOneShotSystemPrompt } from "./SystemPrompt"
+import { buildReplPrompt, buildOneShotPrompt, buildExtractPrompt, truncateOutput, CONTEXT_PREVIEW_CHARS } from "./RlmPrompt"
+import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildExtractSystemPrompt } from "./SystemPrompt"
 import { SandboxFactory } from "./Sandbox"
 import { RlmRuntime } from "./Runtime"
 import { BridgeRequestId, CallId, CallState, RlmCommand, RlmEvent, TranscriptEntry } from "./RlmTypes"
@@ -144,6 +144,14 @@ const failBridgeDeferred = (bridgeRequestId: BridgeRequestId, error: unknown) =>
     const deferred = pending.get(bridgeRequestId)
     if (deferred) yield* Deferred.fail(deferred, new SandboxError({ message: String(error) }))
   })
+
+const formatExecutionError = (error: unknown): string => {
+  if (typeof error === "object" && error !== null && "message" in error) {
+    const message = (error as { readonly message?: unknown }).message
+    return typeof message === "string" ? message : String(message)
+  }
+  return String(error)
+}
 
 // --- Scheduler ---
 
@@ -318,7 +326,21 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
 
       yield* publishEvent(modelEvent)
 
-      // Check for FINAL answer
+      // Code block takes priority over FINAL — if the model included both,
+      // execute the code first so it computes rather than guesses.
+      const code = extractCodeBlock(response.text)
+      if (code !== null) {
+        const nextState = new CallState({
+          ...callState,
+          iteration: callState.iteration + 1,
+          transcript: [...callState.transcript, new TranscriptEntry({ assistantResponse: response.text })]
+        })
+        yield* setCallState(callState.callId, nextState)
+        yield* enqueueOrWarn(RlmCommand.ExecuteCode({ callId: callState.callId, code }))
+        return
+      }
+
+      // No code block — check for FINAL answer
       const finalAnswer = extractFinal(response.text)
       if (finalAnswer !== null) {
         yield* enqueueOrWarn(RlmCommand.Finalize({
@@ -328,30 +350,88 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         return
       }
 
-      // Add model response to transcript
+      // Neither code block nor FINAL — add to transcript and loop
       const nextState = new CallState({
         ...callState,
         iteration: callState.iteration + 1,
         transcript: [...callState.transcript, new TranscriptEntry({ assistantResponse: response.text })]
       })
-
       yield* setCallState(callState.callId, nextState)
-
-      // Extract code block → execute or continue
-      const code = extractCodeBlock(response.text)
-      if (code !== null) {
-        yield* enqueueOrWarn(RlmCommand.ExecuteCode({ callId: callState.callId, code }))
-      } else {
-        yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: callState.callId }))
-      }
+      yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: callState.callId }))
     }).pipe(
       Effect.catchTag("BudgetExhaustedError", (err) =>
-        enqueueOrWarn(RlmCommand.FailCall({
-          callId: command.callId,
-          error: err.resource === "iterations"
-            ? new NoFinalAnswerError({ callId: command.callId, maxIterations: config.maxIterations })
-            : err
-        }))
+        Effect.gen(function*() {
+          // Non-iteration budget exhaustion → hard fail as before
+          if (err.resource !== "iterations") {
+            return yield* enqueueOrWarn(RlmCommand.FailCall({
+              callId: command.callId,
+              error: err
+            }))
+          }
+
+          // Get call state — need transcript for extract prompt
+          const callStateOption = yield* getCallStateOption(command.callId)
+          if (Option.isNone(callStateOption)) {
+            return yield* enqueueOrWarn(RlmCommand.FailCall({
+              callId: command.callId,
+              error: new NoFinalAnswerError({ callId: command.callId, maxIterations: config.maxIterations })
+            }))
+          }
+          const callState = callStateOption.value
+
+          // Attempt extract: reserve LLM call budget (if exhausted, hard fail)
+          const reserveExit = yield* Effect.exit(reserveLlmCall(callState.callId))
+          if (Exit.isFailure(reserveExit)) {
+            return yield* enqueueOrWarn(RlmCommand.FailCall({
+              callId: command.callId,
+              error: new NoFinalAnswerError({ callId: command.callId, maxIterations: config.maxIterations })
+            }))
+          }
+
+          // Build extract prompt with full transcript
+          const extractPrompt = buildExtractPrompt({
+            systemPrompt: buildExtractSystemPrompt(callState.outputJsonSchema),
+            query: callState.query,
+            contextLength: callState.context.length,
+            contextPreview: callState.context.slice(0, CONTEXT_PREVIEW_CHARS),
+            transcript: callState.transcript
+          })
+
+          const response = yield* withLlmPermit(
+            rlmModel.generateText({ prompt: extractPrompt, depth: callState.depth })
+          )
+          yield* recordTokens(callState.callId, response.usage.totalTokens)
+
+          // Publish model response event for observability
+          yield* publishEvent(RlmEvent.ModelResponse({
+            completionId: runtime.completionId,
+            callId: callState.callId,
+            depth: callState.depth,
+            text: response.text,
+            usage: {
+              ...(response.usage.inputTokens !== undefined ? { inputTokens: response.usage.inputTokens } : {}),
+              ...(response.usage.outputTokens !== undefined ? { outputTokens: response.usage.outputTokens } : {}),
+              ...(response.usage.totalTokens !== undefined ? { totalTokens: response.usage.totalTokens } : {})
+            }
+          }))
+
+          // Try extracting FINAL from response
+          const finalAnswer = extractFinal(response.text)
+          if (finalAnswer !== null) {
+            yield* enqueueOrWarn(RlmCommand.Finalize({ callId: callState.callId, answer: finalAnswer }))
+          } else {
+            // Extract didn't produce FINAL() — use raw response text as answer
+            yield* enqueueOrWarn(RlmCommand.Finalize({ callId: callState.callId, answer: response.text }))
+          }
+        }).pipe(
+          // If the extract call itself fails, fall back to NoFinalAnswerError
+          Effect.catchAll(() =>
+            enqueueOrWarn(RlmCommand.FailCall({
+              callId: command.callId,
+              error: new NoFinalAnswerError({ callId: command.callId, maxIterations: config.maxIterations })
+            }))
+          )
+        )
       ),
       Effect.catchAll((error) =>
         enqueueOrWarn(RlmCommand.FailCall({
@@ -386,9 +466,9 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             enqueueOrWarn(RlmCommand.CodeExecuted({ callId: command.callId, output }))
           ),
           Effect.catchAll((error) =>
-            enqueueOrWarn(RlmCommand.FailCall({
+            enqueueOrWarn(RlmCommand.CodeExecuted({
               callId: command.callId,
-              error: new SandboxError({ message: `Code execution failed: ${error.message}` })
+              output: `Error: ${formatExecutionError(error)}`
             }))
           )
         ),

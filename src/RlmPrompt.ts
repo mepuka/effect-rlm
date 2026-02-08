@@ -23,17 +23,25 @@ export const buildReplPrompt = (options: BuildReplPromptOptions): Prompt.Prompt 
 
   messages.push({ role: "system", content: options.systemPrompt })
 
+  const isFirstIteration = options.transcript.length === 0
+  const safeguard = isFirstIteration && options.contextLength > 0
+    ? "You have not seen the context yet. Explore it with code first — do not call FINAL() immediately.\n\n"
+    : ""
+
   const userContent = options.contextLength > 0
-    ? `${options.query}\n\n[Context available in __vars.context (${options.contextLength} chars). Preview: ${options.contextPreview}...]`
+    ? `${safeguard}${options.query}\n\n[Context available in __vars.context (${options.contextLength} chars). Preview: ${options.contextPreview}...]`
     : options.query
   messages.push({ role: "user", content: userContent })
 
   for (const entry of options.transcript) {
     messages.push({ role: "assistant", content: entry.assistantResponse })
     if (entry.executionOutput !== undefined) {
+      const outputText = entry.executionOutput === ""
+        ? "(no output — did you forget to print?)"
+        : entry.executionOutput
       messages.push({
         role: "user",
-        content: `[Execution Output]\n${entry.executionOutput}`
+        content: `[Execution Output]\n${outputText}`
       })
     }
   }
@@ -55,5 +63,39 @@ export const buildOneShotPrompt = (options: BuildOneShotPromptOptions): Prompt.P
     ? `${options.query}\n\nContext: ${boundedContext}`
     : options.query
   messages.push({ role: "user", content: userContent })
+  return Prompt.make(messages)
+}
+
+export interface BuildExtractPromptOptions {
+  readonly systemPrompt: string
+  readonly query: string
+  readonly contextLength: number
+  readonly contextPreview: string
+  readonly transcript: ReadonlyArray<TranscriptEntry>
+}
+
+export const buildExtractPrompt = (options: BuildExtractPromptOptions): Prompt.Prompt => {
+  const messages: Array<Prompt.MessageEncoded> = []
+
+  messages.push({ role: "system", content: options.systemPrompt })
+
+  const userContent = options.contextLength > 0
+    ? `${options.query}\n\n[Context was available in __vars.context (${options.contextLength} chars). Preview: ${options.contextPreview}...]`
+    : options.query
+  messages.push({ role: "user", content: userContent })
+
+  for (const entry of options.transcript) {
+    messages.push({ role: "assistant", content: entry.assistantResponse })
+    if (entry.executionOutput !== undefined) {
+      const outputText = entry.executionOutput === ""
+        ? "(no output)"
+        : entry.executionOutput
+      messages.push({
+        role: "user",
+        content: `[Execution Output]\n${outputText}`
+      })
+    }
+  }
+
   return Prompt.make(messages)
 }
