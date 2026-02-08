@@ -696,7 +696,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         return
       }
 
-      if (callState.depth >= config.maxDepth) {
+      if (callState.depth + 1 >= config.maxDepth) {
         // At max depth: one-shot model call (no REPL protocol) with budget reservation
         yield* Effect.forkIn(
           Effect.gen(function*() {
