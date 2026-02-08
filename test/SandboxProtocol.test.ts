@@ -8,6 +8,8 @@ import {
   GetVarResult,
   HostToWorker,
   Init,
+  ListVarsRequest,
+  ListVarsResult,
   SetVar,
   checkFrameSize,
   decodeWorkerToHost
@@ -32,6 +34,12 @@ describe("SandboxProtocol", () => {
     test("decodes GetVarRequest", () => {
       const msg = decode({ _tag: "GetVarRequest", requestId: "r3", name: "x" })
       expect(msg._tag).toBe("GetVarRequest")
+    })
+
+    test("decodes ListVarsRequest", () => {
+      const msg = decode({ _tag: "ListVarsRequest", requestId: "r3b" })
+      expect(msg._tag).toBe("ListVarsRequest")
+      expect((msg as typeof ListVarsRequest.Type).requestId).toBe("r3b")
     })
 
     test("decodes BridgeResult", () => {
@@ -95,6 +103,22 @@ describe("SandboxProtocol", () => {
       const msg = decodeWorkerToHost({ _tag: "GetVarResult", requestId: "r1", value: [1, 2, 3] })
       expect(msg._tag).toBe("GetVarResult")
       expect((msg as typeof GetVarResult.Type).value).toEqual([1, 2, 3])
+    })
+
+    test("decodes ListVarsResult", () => {
+      const msg = decodeWorkerToHost({
+        _tag: "ListVarsResult",
+        requestId: "r1",
+        variables: [
+          { name: "foo", type: "string", size: 3, preview: "bar" },
+          { name: "count", type: "number", preview: "42" }
+        ]
+      })
+      expect(msg._tag).toBe("ListVarsResult")
+      expect((msg as typeof ListVarsResult.Type).variables).toEqual([
+        { name: "foo", type: "string", size: 3, preview: "bar" },
+        { name: "count", type: "number", preview: "42" }
+      ])
     })
 
     test("decodes BridgeCall", () => {

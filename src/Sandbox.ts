@@ -7,6 +7,7 @@ export interface SandboxConfigService {
   readonly executeTimeoutMs: number
   readonly setVarTimeoutMs: number
   readonly getVarTimeoutMs: number
+  readonly listVarTimeoutMs: number
   readonly shutdownGraceMs: number
   readonly maxFrameBytes: number
   readonly maxBridgeConcurrency: number
@@ -14,10 +15,18 @@ export interface SandboxConfigService {
   readonly workerPath: string
 }
 
+export interface VariableMetadata {
+  readonly name: string
+  readonly type: string
+  readonly size?: number
+  readonly preview: string
+}
+
 export interface SandboxInstance {
   readonly execute: (code: string) => Effect.Effect<string, SandboxError>
   readonly setVariable: (name: string, value: unknown) => Effect.Effect<void, SandboxError>
   readonly getVariable: (name: string) => Effect.Effect<unknown, SandboxError>
+  readonly listVariables: () => Effect.Effect<ReadonlyArray<VariableMetadata>, SandboxError>
 }
 
 export interface ToolDescriptorForSandbox {
@@ -42,9 +51,10 @@ export class SandboxConfig extends Context.Reference<SandboxConfig>()(
   {
     defaultValue: (): SandboxConfigService => ({
       sandboxMode: "permissive",
-      executeTimeoutMs: 30_000,
+      executeTimeoutMs: 120_000,
       setVarTimeoutMs: 5_000,
       getVarTimeoutMs: 5_000,
+      listVarTimeoutMs: 5_000,
       shutdownGraceMs: 2_000,
       maxFrameBytes: 4 * 1024 * 1024,
       maxBridgeConcurrency: 4,
@@ -61,7 +71,8 @@ export const noopSandboxFactoryLayer = Layer.succeed(
       Effect.succeed({
         execute: () => Effect.succeed(""),
         setVariable: () => Effect.void,
-        getVariable: () => Effect.void
+        getVariable: () => Effect.void,
+        listVariables: () => Effect.succeed([])
       })
   })
 )

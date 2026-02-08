@@ -33,6 +33,16 @@ export const makeFakeSandboxFactoryLayer = (
           }),
           getVariable: Effect.fn("FakeSandbox.getVariable")(function*(name: string) {
             return vars.get(name)
+          }),
+          listVariables: Effect.fn("FakeSandbox.listVariables")(function*() {
+            return Array.from(vars.entries()).map(([name, value]) => ({
+              name,
+              type: value === null ? "null" : typeof value,
+              ...(typeof value === "string" ? { size: value.length } : {}),
+              preview: typeof value === "string"
+                ? (value.length > 200 ? value.slice(0, 200) + "..." : value)
+                : String(value)
+            }))
           })
         })
       }

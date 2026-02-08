@@ -15,6 +15,18 @@ describe("SystemPrompt", () => {
     expect(prompt).toContain("FINAL")
   })
 
+  test("REPL prompt contains SUBMIT instruction", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("SUBMIT")
+  })
+
+  test("REPL prompt includes SUBMIT parameter schema guidance", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("SUBMIT parameters schema")
+    expect(prompt).toContain("Plain-text final answer")
+    expect(prompt).toContain("Structured final value")
+  })
+
   test("REPL prompt contains llm_query when depth < maxDepth", () => {
     const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
     expect(prompt).toContain("llm_query")
@@ -42,10 +54,12 @@ describe("SystemPrompt", () => {
     expect(prompt).not.toContain("some actual user context data")
   })
 
-  test("one-shot prompt does NOT mention FINAL or code blocks", () => {
+  test("one-shot prompt does NOT mention tool-call syntax or code blocks", () => {
     const prompt = buildOneShotSystemPrompt()
     expect(prompt).not.toContain("```")
-    expect(prompt).toContain("Do not use code blocks, FINAL()")
+    expect(prompt).toContain("Do not use code blocks")
+    expect(prompt).toContain("SUBMIT()")
+    expect(prompt).toContain("FINAL()")
   })
 
   test("REPL prompt includes tool documentation when tools provided", () => {
@@ -212,9 +226,11 @@ describe("SystemPrompt", () => {
 describe("buildExtractSystemPrompt", () => {
   test("returns FINAL instruction", () => {
     const prompt = buildExtractSystemPrompt()
+    expect(prompt).toContain("SUBMIT")
     expect(prompt).toContain("FINAL")
     expect(prompt).toContain("ran out of iterations")
     expect(prompt).toContain('FINAL("your answer")')
+    expect(prompt).toContain("Do not output both SUBMIT and FINAL")
   })
 
   test("includes JSON schema when provided", () => {
@@ -224,6 +240,7 @@ describe("buildExtractSystemPrompt", () => {
     expect(prompt).toContain('"result"')
     expect(prompt).toContain("FINAL(`{...}`)")
     expect(prompt).toContain("not escaped")
+    expect(prompt).toContain("Fallback only if tool calling is unavailable")
     expect(prompt).not.toContain('FINAL("your answer")')
   })
 

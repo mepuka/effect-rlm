@@ -1,7 +1,7 @@
 import { Data, Deferred, Duration, Effect, FiberSet, Layer, Match, Option, Queue, Ref, Runtime, Stream } from "effect"
 import { BridgeHandler } from "./BridgeHandler"
 import { SandboxError } from "./RlmError"
-import { SandboxConfig, SandboxFactory, type SandboxInstance } from "./Sandbox"
+import { SandboxConfig, SandboxFactory, type SandboxInstance, type VariableMetadata } from "./Sandbox"
 import { checkFrameSize, decodeWorkerToHost, type WorkerToHost } from "./SandboxProtocol"
 import type { CallId } from "./RlmTypes"
 
@@ -172,6 +172,12 @@ const dispatchFrame = (
           const pending = yield* Ref.get(pendingRequests)
           const deferred = pending.get(f.requestId)
           if (deferred) yield* Deferred.succeed(deferred, f.value)
+        }),
+      ListVarsResult: (f) =>
+        Effect.gen(function*() {
+          const pending = yield* Ref.get(pendingRequests)
+          const deferred = pending.get(f.requestId)
+          if (deferred) yield* Deferred.succeed(deferred, f.variables)
         }),
       BridgeCall: (f) => {
         if (config.sandboxMode === "strict") {
@@ -381,6 +387,15 @@ const createSandboxInstance = (
           { _tag: "GetVarRequest", requestId, name },
           requestId,
           config.getVarTimeoutMs
+        )
+      },
+      listVariables: () => {
+        const requestId = crypto.randomUUID()
+        return sendRequest<ReadonlyArray<VariableMetadata>>(
+          state,
+          { _tag: "ListVarsRequest", requestId },
+          requestId,
+          config.listVarTimeoutMs
         )
       }
     } satisfies SandboxInstance

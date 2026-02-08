@@ -24,6 +24,8 @@
     "@effect/experimental": "^0.58.0",
     "@effect/platform": "^0.94.3",
     "@effect/platform-bun": "^0.87.1",
+    "@effect/printer": "^0.47.0",
+    "@effect/printer-ansi": "^0.47.0",
     "effect": "^3.19.16"
   }
 }

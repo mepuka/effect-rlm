@@ -10,7 +10,7 @@ import { RlmRuntime, RlmRuntimeLive } from "../src/Runtime"
 import { BridgeRequestId, CallId, RlmCommand } from "../src/RlmTypes"
 import { runScheduler } from "../src/Scheduler"
 import * as RlmTool from "../src/RlmTool"
-import { makeFakeRlmModelLayer, type FakeModelMetrics } from "./helpers/FakeRlmModel"
+import { makeFakeRlmModelLayer, type FakeModelMetrics, type FakeModelResponse } from "./helpers/FakeRlmModel"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./helpers/FakeSandboxFactory"
 import { makeCustomSandboxFactoryLayer } from "./helpers/CustomSandboxFactory"
 
@@ -24,7 +24,7 @@ const defaultConfig: RlmConfigService = {
 }
 
 const makeLayers = (options: {
-  readonly responses: ReadonlyArray<{ readonly text: string; readonly totalTokens?: number }>
+  readonly responses: ReadonlyArray<FakeModelResponse>
   readonly modelMetrics?: FakeModelMetrics
   readonly sandboxMetrics?: FakeSandboxMetrics
   readonly config?: Partial<RlmConfigService>
@@ -121,6 +121,239 @@ describe("Scheduler integration", () => {
 
     // No sandbox execution for FINAL-only response
     expect(sandboxMetrics.executeCalls).toBe(0)
+  })
+
+  test("SUBMIT tool call finalizes immediately (no sandbox execution)", async () => {
+    const sandboxMetrics: FakeSandboxMetrics = {
+      createCalls: 0,
+      executeCalls: 0,
+      snippets: []
+    }
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      toolChoices: [],
+      disableToolCallResolutions: []
+    }
+
+    const answer = await Effect.runPromise(
+      complete({
+        query: "quick answer",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [{
+              text: "Submitting final answer.",
+              toolCalls: [{
+                name: "SUBMIT",
+                params: { answer: "42" }
+              }]
+            }],
+            sandboxMetrics,
+            modelMetrics
+          })
+        )
+      )
+    )
+
+    expect(answer._tag).toBe("Right")
+    if (answer._tag === "Right") {
+      expect(answer.right).toBe("42")
+    }
+    expect(sandboxMetrics.executeCalls).toBe(0)
+    expect(modelMetrics.toolChoices?.[0]).toBe("auto")
+    expect(modelMetrics.disableToolCallResolutions?.[0]).toBe(true)
+  })
+
+  test("SUBMIT tool call takes priority over code blocks in mixed responses", async () => {
+    const sandboxMetrics: FakeSandboxMetrics = {
+      createCalls: 0,
+      executeCalls: 0,
+      snippets: []
+    }
+
+    const answer = await Effect.runPromise(
+      complete({
+        query: "mixed response",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [{
+              text: "```js\nprint('should not run')\n```",
+              toolCalls: [{
+                name: "SUBMIT",
+                params: { answer: "tool-wins" }
+              }]
+            }],
+            sandboxMetrics
+          })
+        )
+      )
+    )
+
+    expect(answer._tag).toBe("Right")
+    if (answer._tag === "Right") {
+      expect(answer.right).toBe("tool-wins")
+    }
+    expect(sandboxMetrics.executeCalls).toBe(0)
+  })
+
+  test("mixed SUBMIT + code emits warning and still finalizes on SUBMIT", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const runtime = yield* RlmRuntime
+          const subscription = yield* PubSub.subscribe(runtime.events)
+
+          const answer = yield* runScheduler({
+            query: "mixed response",
+            context: "ctx"
+          })
+
+          const events = yield* subscription.takeAll
+          return { answer, events: Chunk.toReadonlyArray(events) }
+        }).pipe(
+          Effect.provide(
+            makeLayers({
+              responses: [{
+                text: "```js\nprint('should not run')\n```",
+                toolCalls: [{
+                  name: "SUBMIT",
+                  params: { answer: "tool-wins" }
+                }]
+              }]
+            })
+          )
+        )
+      )
+    )
+
+    expect(result.answer).toBe("tool-wins")
+    const warning = result.events.find((event) =>
+      event._tag === "SchedulerWarning" && event.code === "MIXED_SUBMIT_AND_CODE"
+    )
+    expect(warning).toBeDefined()
+  })
+
+  test("tool-enabled generation degrades to text mode when tool path fails", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      toolChoices: [],
+      disableToolCallResolutions: []
+    }
+
+    const result = await Effect.runPromise(
+      complete({
+        query: "fallback on tool decode failure",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              { error: "Failed to decode tool call parameters for tool 'SUBMIT'" },
+              { text: 'FINAL("fallback-ok")' }
+            ],
+            modelMetrics
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("fallback-ok")
+    }
+    expect(modelMetrics.toolChoices).toEqual(["auto", "none"])
+    expect(modelMetrics.disableToolCallResolutions).toEqual([true, undefined])
+  })
+
+  test("extract fallback forces SUBMIT tool choice", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      toolChoices: [],
+      disableToolCallResolutions: []
+    }
+
+    const result = await Effect.runPromise(
+      complete({
+        query: "compute",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              { text: "I need one more pass." },
+              {
+                toolCalls: [{
+                  name: "SUBMIT",
+                  params: { answer: "extracted" }
+                }]
+              }
+            ],
+            modelMetrics,
+            config: { maxIterations: 1 }
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("extracted")
+    }
+    expect(modelMetrics.calls).toBe(2)
+    expect(modelMetrics.toolChoices?.[0]).toBe("auto")
+    expect(modelMetrics.toolChoices?.[1]).toEqual({ tool: "SUBMIT" })
+    expect(modelMetrics.disableToolCallResolutions?.[0]).toBe(true)
+    expect(modelMetrics.disableToolCallResolutions?.[1]).toBe(true)
+  })
+
+  test("extract path degrades to text mode when forced SUBMIT tool path fails", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      toolChoices: [],
+      disableToolCallResolutions: []
+    }
+
+    const result = await Effect.runPromise(
+      complete({
+        query: "compute",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              { text: "I need one more pass." },
+              { error: "Failed to decode tool call parameters for tool 'SUBMIT'" },
+              { text: 'FINAL("extract-fallback")' }
+            ],
+            modelMetrics,
+            config: { maxIterations: 1 }
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("extract-fallback")
+    }
+    expect(modelMetrics.toolChoices).toEqual(["auto", { tool: "SUBMIT" }, "none"])
+    expect(modelMetrics.disableToolCallResolutions).toEqual([true, true, undefined])
   })
 
   test("no code block and no FINAL → loops to next GenerateStep", async () => {
@@ -379,7 +612,8 @@ describe("Scheduler integration", () => {
           Effect.succeed({
             execute: () => Effect.never,
             setVariable: () => Effect.void,
-            getVariable: () => Effect.void
+            getVariable: () => Effect.void,
+            listVariables: () => Effect.succeed([])
           })
       })
     )
@@ -661,10 +895,11 @@ describe("Scheduler integration", () => {
 
 describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
   const makeRealSandboxLayers = (options: {
-    readonly responses: ReadonlyArray<{ readonly text: string; readonly totalTokens?: number }>
+    readonly responses: ReadonlyArray<FakeModelResponse>
+    readonly modelMetrics?: FakeModelMetrics
     readonly config?: Partial<RlmConfigService>
   }) => {
-    const model = makeFakeRlmModelLayer(options.responses)
+    const model = makeFakeRlmModelLayer(options.responses, options.modelMetrics)
     // Mirror rlmBunLayer composition: RlmRuntimeLive → BridgeHandlerLive → SandboxBunLive
     const perCallLayer = Layer.fresh(
       Layer.provideMerge(
@@ -711,6 +946,61 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     expect(answer).toBe("5")
   }, 15_000)
 
+  test("tool bridge calls retry transient failures before surfacing errors", async () => {
+    let attempts = 0
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: []
+    }
+
+    const flakyAdd = RlmTool.make("flaky_add", {
+      description: "Add two numbers with a transient failure",
+      parameters: { a: Schema.Number, b: Schema.Number },
+      returns: Schema.Number,
+      handler: ({ a, b }) => {
+        attempts += 1
+        if (attempts === 1) {
+          return Effect.fail(new RlmTool.RlmToolError({
+            message: "transient tool failure",
+            toolName: "flaky_add"
+          }))
+        }
+        return Effect.succeed(a + b)
+      }
+    })
+
+    const answer = await Effect.runPromise(
+      complete({
+        query: "retry flaky tool",
+        context: "math",
+        tools: [flakyAdd]
+      }).pipe(
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nconst result = await flaky_add(2, 3)\nprint(result)\n```" },
+            { text: 'FINAL("5")' }
+          ],
+          modelMetrics
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    expect(answer).toBe("5")
+    expect(attempts).toBe(2)
+
+    const secondPrompt = modelMetrics.prompts[1]!
+    const userMessages = secondPrompt.content.filter((m) => m.role === "user")
+    const lastUserMsg = userMessages[userMessages.length - 1]!
+    const lastUserText = lastUserMsg.role === "user"
+      ? (lastUserMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(lastUserText).toContain("[Execution Output]")
+    expect(lastUserText).toContain("5")
+    expect(lastUserText).not.toContain("Error:")
+  }, 15_000)
+
   test("unknown tool method fails bridge deferred", async () => {
     const answer = await Effect.runPromise(
       complete({
@@ -729,6 +1019,49 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
 
     // The sandbox should catch the error since nonexistent is not a defined function
     expect(answer).toBe("handled")
+  }, 15_000)
+
+  test("max-depth llm_query retries transient sub-call failures and recovers", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: []
+    }
+
+    const answer = await Effect.runPromise(
+      complete({
+        query: "retry llm_query",
+        context: "ctx"
+      }).pipe(
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nconst result = await llm_query('sub-query', 'sub-context')\nprint(result)\n```" },
+            { error: "transient sub-call model error" },
+            { text: "sub-answer" },
+            { text: 'FINAL("sub-answer")' },
+            { text: 'FINAL("done")' }
+          ],
+          modelMetrics,
+          config: {
+            maxDepth: 0
+          }
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    expect(answer).toBe("done")
+    expect(modelMetrics.depths[0]).toBe(0)
+    expect(modelMetrics.depths.some((depth) => depth === 1)).toBe(true)
+
+    const finalPrompt = modelMetrics.prompts[modelMetrics.prompts.length - 1]!
+    const userMessages = finalPrompt.content.filter((m) => m.role === "user")
+    const lastUserMsg = userMessages[userMessages.length - 1]!
+    const lastUserText = lastUserMsg.role === "user"
+      ? (lastUserMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
+      : ""
+    expect(lastUserText).toContain("[Execution Output]")
+    expect(lastUserText).toContain("sub-answer")
   }, 15_000)
 
   test("context and query are injected into __vars before code execution", async () => {

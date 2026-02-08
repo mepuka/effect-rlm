@@ -4,7 +4,7 @@ import { complete, stream } from "../src/Rlm"
 import { RlmConfig, type RlmConfigService } from "../src/RlmConfig"
 import { BudgetExhaustedError, OutputValidationError } from "../src/RlmError"
 import { RlmRuntimeLive } from "../src/Runtime"
-import { makeFakeRlmModelLayer, type FakeModelMetrics } from "./helpers/FakeRlmModel"
+import { makeFakeRlmModelLayer, type FakeModelMetrics, type FakeModelResponse } from "./helpers/FakeRlmModel"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./helpers/FakeSandboxFactory"
 
 const defaultConfig: RlmConfigService = {
@@ -17,7 +17,7 @@ const defaultConfig: RlmConfigService = {
 }
 
 const makeLayers = (options: {
-  readonly responses: ReadonlyArray<{ readonly text: string; readonly totalTokens?: number }>
+  readonly responses: ReadonlyArray<FakeModelResponse>
   readonly modelMetrics?: FakeModelMetrics
   readonly sandboxMetrics?: FakeSandboxMetrics
   readonly config?: Partial<RlmConfigService>
@@ -62,6 +62,59 @@ describe("Rlm thin slice", () => {
     }
     expect(modelMetrics.calls).toBe(1)
     expect(sandboxMetrics.createCalls).toBe(1)
+  })
+
+  test("returns final answer from SUBMIT tool call", async () => {
+    const result = await Effect.runPromise(
+      complete({
+        query: "What is 2+2?",
+        context: "2+2=4"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [{
+              text: "Submitting answer",
+              toolCalls: [{
+                name: "SUBMIT",
+                params: { answer: "4" }
+              }]
+            }]
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("4")
+    }
+  })
+
+  test("SUBMIT value fallback finalizes even when JSON serialization fails", async () => {
+    const result = await Effect.runPromise(
+      complete({
+        query: "return bigint",
+        context: "ctx"
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [{
+              toolCalls: [{
+                name: "SUBMIT",
+                params: { value: 10n }
+              }]
+            }]
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("10")
+    }
   })
 
   test("reserves llm budget before model invocation", async () => {
@@ -136,6 +189,38 @@ describe("Rlm thin slice", () => {
 })
 
 describe("Rlm typed output", () => {
+  test("complete with outputSchema accepts SUBMIT value payload", async () => {
+    const ResultSchema = Schema.Struct({
+      answer: Schema.Number,
+      unit: Schema.String
+    })
+
+    const result = await Effect.runPromise(
+      complete({
+        query: "What is 2+2?",
+        context: "math",
+        outputSchema: ResultSchema
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [{
+              toolCalls: [{
+                name: "SUBMIT",
+                params: { value: { answer: 4, unit: "count" } }
+              }]
+            }]
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toEqual({ answer: 4, unit: "count" })
+    }
+  })
+
   test("complete with outputSchema returns parsed object", async () => {
     const ResultSchema = Schema.Struct({
       answer: Schema.Number,

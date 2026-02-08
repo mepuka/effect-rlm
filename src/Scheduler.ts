@@ -1,5 +1,14 @@
-import { Deferred, Duration, Effect, Exit, Match, Option, PubSub, Queue, Ref, Scope, Stream } from "effect"
+import { Deferred, Duration, Effect, Exit, Match, Option, PubSub, Queue, Ref, Schedule, Scope, Stream } from "effect"
 import { consumeIteration, recordTokens, reserveLlmCall, snapshot, withLlmPermit } from "./Budget"
+import {
+  appendTranscript,
+  attachExecutionOutput,
+  incrementIteration,
+  makeCallContext,
+  readIteration,
+  readTranscript,
+  type CallContext
+} from "./CallContext"
 import { extractCodeBlock, extractFinal } from "./CodeExtractor"
 import { RlmConfig } from "./RlmConfig"
 import { RlmModel } from "./RlmModel"
@@ -11,9 +20,11 @@ import {
 } from "./RlmError"
 import { buildReplPrompt, buildOneShotPrompt, buildExtractPrompt, truncateOutput, CONTEXT_PREVIEW_CHARS } from "./RlmPrompt"
 import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildExtractSystemPrompt } from "./SystemPrompt"
+import { extractSubmitAnswer, SUBMIT_TOOL_NAME, submitToolkit } from "./SubmitTool"
 import { SandboxFactory } from "./Sandbox"
 import { RlmRuntime } from "./Runtime"
-import { BridgeRequestId, CallId, CallState, RlmCommand, RlmEvent, TranscriptEntry } from "./RlmTypes"
+import { BridgeRequestId, CallId, RlmCommand, RlmEvent } from "./RlmTypes"
+import { makeCallVariableSpace } from "./VariableSpace"
 
 import type { RlmToolAny } from "./RlmTool"
 
@@ -34,7 +45,12 @@ const publishEvent = Effect.fnUntraced(function*(event: RlmEvent) {
 })
 
 const publishSchedulerWarning = Effect.fnUntraced(function*(warning: {
-  readonly code: "STALE_COMMAND_DROPPED" | "QUEUE_CLOSED" | "CALL_SCOPE_CLEANUP"
+  readonly code:
+    | "STALE_COMMAND_DROPPED"
+    | "QUEUE_CLOSED"
+    | "CALL_SCOPE_CLEANUP"
+    | "MIXED_SUBMIT_AND_CODE"
+    | "TOOLKIT_DEGRADED"
   readonly message: string
   readonly callId?: CallId
   readonly commandTag?: RlmCommand["_tag"]
@@ -88,7 +104,7 @@ const getCallStateOption = Effect.fnUntraced(function*(callId: CallId) {
 
 const setCallState = Effect.fnUntraced(function*(
   callId: CallId,
-  state: CallState
+  state: CallContext
 ) {
   const runtime = yield* RlmRuntime
   yield* Ref.update(runtime.callStates, (current) => {
@@ -122,7 +138,7 @@ const getCallStateOrWarn = Effect.fnUntraced(function*(
       callId: options.callId,
       commandTag: options.commandTag
     })
-    return Option.none<CallState>()
+    return Option.none<CallContext>()
   }
   return callStateOption
 })
@@ -163,6 +179,17 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
   const config = yield* RlmConfig
   const rlmModel = yield* RlmModel
   const sandboxFactory = yield* SandboxFactory
+  const bridgeRetryBaseDelayMs = config.bridgeRetryBaseDelayMs ?? 50
+  const bridgeToolRetryCount = config.bridgeToolRetryCount ?? 1
+  const bridgeLlmQueryRetryCount = config.bridgeLlmQueryRetryCount ?? 1
+
+  const bridgeToolRetryPolicy = Schedule.exponential(Duration.millis(bridgeRetryBaseDelayMs)).pipe(
+    Schedule.compose(Schedule.recurs(bridgeToolRetryCount))
+  )
+
+  const bridgeLlmQueryRetryPolicy = Schedule.exponential(Duration.millis(bridgeRetryBaseDelayMs)).pipe(
+    Schedule.compose(Schedule.recurs(bridgeLlmQueryRetryCount))
+  )
 
   const resultDeferred = yield* Deferred.make<string, RlmError>()
 
@@ -187,16 +214,11 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             : {})
         }).pipe(Effect.provideService(Scope.Scope, callScope))
 
-        yield* sandbox.setVariable("context", command.context)
-        yield* sandbox.setVariable("query", command.query)
-
-        const state = new CallState({
+        const state = yield* makeCallContext({
           callId: command.callId,
           depth: command.depth,
           query: command.query,
           context: command.context,
-          iteration: 0,
-          transcript: [],
           sandbox,
           callScope,
           ...(command.parentBridgeRequestId !== undefined
@@ -208,6 +230,12 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           ...(command.outputJsonSchema !== undefined
             ? { outputJsonSchema: command.outputJsonSchema }
             : {})
+        })
+
+        const vars = makeCallVariableSpace(state)
+        yield* vars.injectAll({
+          context: command.context,
+          query: command.query
         })
 
         yield* setCallState(command.callId, state)
@@ -250,6 +278,8 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       })
       if (Option.isNone(callStateOption)) return
       const callState = callStateOption.value
+      const iteration = yield* readIteration(callState)
+      const transcript = yield* readTranscript(callState)
 
       yield* consumeIteration(callState.callId)
 
@@ -258,7 +288,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         completionId: runtime.completionId,
         callId: callState.callId,
         depth: callState.depth,
-        iteration: callState.iteration + 1,
+        iteration: iteration + 1,
         budget
       }))
 
@@ -275,7 +305,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       const prompt = buildReplPrompt({
         systemPrompt: buildReplSystemPrompt({
           depth: callState.depth,
-          iteration: callState.iteration + 1,
+          iteration: iteration + 1,
           maxIterations: config.maxIterations,
           maxDepth: config.maxDepth,
           budget: {
@@ -292,10 +322,38 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         query: callState.query,
         contextLength: callState.context.length,
         contextPreview: callState.context.slice(0, CONTEXT_PREVIEW_CHARS),
-        transcript: callState.transcript
+        transcript
       })
       const response = yield* withLlmPermit(
-        rlmModel.generateText({ prompt, depth: callState.depth })
+        rlmModel.generateText({
+          prompt,
+          depth: callState.depth,
+          toolkit: submitToolkit,
+          toolChoice: "auto",
+          disableToolCallResolution: true
+        })
+      ).pipe(
+        Effect.catchAll((error) =>
+          Effect.gen(function*() {
+            yield* publishSchedulerWarning({
+              code: "TOOLKIT_DEGRADED",
+              message: `Tool-enabled generation failed; retrying this iteration without tool calling (${formatExecutionError(error)})`,
+              callId: callState.callId,
+              commandTag: command._tag
+            })
+
+            // Fallback call consumes another LLM budget slot.
+            yield* reserveLlmCall(callState.callId)
+
+            return yield* withLlmPermit(
+              rlmModel.generateText({
+                prompt,
+                depth: callState.depth,
+                toolChoice: "none"
+              })
+            )
+          })
+        )
       )
 
       yield* recordTokens(callState.callId, response.usage.totalTokens)
@@ -326,21 +384,34 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
 
       yield* publishEvent(modelEvent)
 
-      // Code block takes priority over FINAL — if the model included both,
-      // execute the code first so it computes rather than guesses.
+      // Structured SUBMIT tool-call is the primary finalization path.
+      const submitAnswer = extractSubmitAnswer(response)
       const code = extractCodeBlock(response.text)
+      if (submitAnswer !== undefined) {
+        if (code !== null) {
+          yield* publishSchedulerWarning({
+            code: "MIXED_SUBMIT_AND_CODE",
+            message: "Model returned both SUBMIT and executable code; prioritizing SUBMIT and ignoring code block",
+            callId: callState.callId,
+            commandTag: command._tag
+          })
+        }
+        yield* enqueueOrWarn(RlmCommand.Finalize({
+          callId: callState.callId,
+          answer: submitAnswer.answer
+        }))
+        return
+      }
+
+      // No SUBMIT — code block takes priority over legacy FINAL().
       if (code !== null) {
-        const nextState = new CallState({
-          ...callState,
-          iteration: callState.iteration + 1,
-          transcript: [...callState.transcript, new TranscriptEntry({ assistantResponse: response.text })]
-        })
-        yield* setCallState(callState.callId, nextState)
+        yield* appendTranscript(callState, response.text)
+        yield* incrementIteration(callState)
         yield* enqueueOrWarn(RlmCommand.ExecuteCode({ callId: callState.callId, code }))
         return
       }
 
-      // No code block — check for FINAL answer
+      // No code block — check for legacy FINAL answer
       const finalAnswer = extractFinal(response.text)
       if (finalAnswer !== null) {
         yield* enqueueOrWarn(RlmCommand.Finalize({
@@ -350,13 +421,9 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         return
       }
 
-      // Neither code block nor FINAL — add to transcript and loop
-      const nextState = new CallState({
-        ...callState,
-        iteration: callState.iteration + 1,
-        transcript: [...callState.transcript, new TranscriptEntry({ assistantResponse: response.text })]
-      })
-      yield* setCallState(callState.callId, nextState)
+      // Neither SUBMIT, code block, nor FINAL — add to transcript and loop
+      yield* appendTranscript(callState, response.text)
+      yield* incrementIteration(callState)
       yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: callState.callId }))
     }).pipe(
       Effect.catchTag("BudgetExhaustedError", (err) =>
@@ -388,17 +455,47 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             }))
           }
 
+          const transcript = yield* readTranscript(callState)
+
           // Build extract prompt with full transcript
           const extractPrompt = buildExtractPrompt({
             systemPrompt: buildExtractSystemPrompt(callState.outputJsonSchema),
             query: callState.query,
             contextLength: callState.context.length,
             contextPreview: callState.context.slice(0, CONTEXT_PREVIEW_CHARS),
-            transcript: callState.transcript
+            transcript
           })
 
           const response = yield* withLlmPermit(
-            rlmModel.generateText({ prompt: extractPrompt, depth: callState.depth })
+            rlmModel.generateText({
+              prompt: extractPrompt,
+              depth: callState.depth,
+              toolkit: submitToolkit,
+              toolChoice: { tool: SUBMIT_TOOL_NAME },
+              disableToolCallResolution: true
+            })
+          ).pipe(
+            Effect.catchAll((error) =>
+              Effect.gen(function*() {
+                yield* publishSchedulerWarning({
+                  code: "TOOLKIT_DEGRADED",
+                  message: `Tool-enabled extract failed; retrying extract without tool calling (${formatExecutionError(error)})`,
+                  callId: callState.callId,
+                  commandTag: command._tag
+                })
+
+                // Fallback extract consumes another LLM budget slot.
+                yield* reserveLlmCall(callState.callId)
+
+                return yield* withLlmPermit(
+                  rlmModel.generateText({
+                    prompt: extractPrompt,
+                    depth: callState.depth,
+                    toolChoice: "none"
+                  })
+                )
+              })
+            )
           )
           yield* recordTokens(callState.callId, response.usage.totalTokens)
 
@@ -415,13 +512,35 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             }
           }))
 
+          const submitAnswer = extractSubmitAnswer(response)
+          if (submitAnswer !== undefined) {
+            yield* enqueueOrWarn(RlmCommand.Finalize({
+              callId: callState.callId,
+              answer: submitAnswer.answer
+            }))
+            return
+          }
+
           // Try extracting FINAL from response
           const finalAnswer = extractFinal(response.text)
           if (finalAnswer !== null) {
             yield* enqueueOrWarn(RlmCommand.Finalize({ callId: callState.callId, answer: finalAnswer }))
           } else {
-            // Extract didn't produce FINAL() — use raw response text as answer
-            yield* enqueueOrWarn(RlmCommand.Finalize({ callId: callState.callId, answer: response.text }))
+            // Extract didn't produce FINAL() — strip code blocks and use
+            // the best available content as the answer
+            const stripped = response.text.replace(/```[\s\S]*?```/g, "").trim()
+            const lastOutput = transcript.length > 0
+              ? transcript[transcript.length - 1]!.executionOutput?.trim()
+              : undefined
+            // Prefer last execution output when it has real data and stripped
+            // text is just short commentary (the model continued generating
+            // code instead of answering)
+            const preferOutput = lastOutput && lastOutput.length > 0
+              && (stripped.length === 0 || (lastOutput.length > stripped.length * 2))
+            const answer = preferOutput
+              ? lastOutput!
+              : (stripped.length > 0 ? stripped : response.text)
+            yield* enqueueOrWarn(RlmCommand.Finalize({ callId: callState.callId, answer }))
           }
         }).pipe(
           // If the extract call itself fails, fall back to NoFinalAnswerError
@@ -494,17 +613,13 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         output: command.output
       }))
 
-      // Update last transcript entry with (truncated) execution output
-      const transcript = [...callState.transcript]
-      const last = transcript[transcript.length - 1]
-      if (last) {
-        transcript[transcript.length - 1] = new TranscriptEntry({
-          ...last,
-          executionOutput: truncateOutput(command.output)
-        })
-      }
+      yield* attachExecutionOutput(callState, truncateOutput(command.output))
 
-      yield* setCallState(command.callId, new CallState({ ...callState, transcript }))
+      const vars = makeCallVariableSpace(callState)
+      yield* vars.sync.pipe(
+        Effect.catchAll(() => Effect.void)
+      )
+
       yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: command.callId }))
     })
 
@@ -546,6 +661,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
               duration: Duration.millis(tool.timeoutMs),
               onTimeout: () => new SandboxError({ message: `Tool ${tool.name} timed out` })
             }),
+            Effect.retry(bridgeToolRetryPolicy),
             Effect.flatMap((result) => resolveBridgeDeferred(command.bridgeRequestId, result)),
             Effect.catchAll((err) =>
               failBridgeDeferred(command.bridgeRequestId, "message" in err ? err.message : String(err))
@@ -560,17 +676,24 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         // At max depth: one-shot model call (no REPL protocol) with budget reservation
         yield* Effect.forkIn(
           Effect.gen(function*() {
-            yield* reserveLlmCall(command.callId)
             const oneShotPrompt = buildOneShotPrompt({
               systemPrompt: buildOneShotSystemPrompt(),
               query: String(command.args[0]),
               context: String(command.args[1] ?? "")
             })
-            const response = yield* withLlmPermit(
-              rlmModel.generateText({ prompt: oneShotPrompt, depth: callState.depth + 1 })
+
+            const oneShotResponseText = yield* Effect.gen(function*() {
+              yield* reserveLlmCall(command.callId)
+              const response = yield* withLlmPermit(
+                rlmModel.generateText({ prompt: oneShotPrompt, depth: callState.depth + 1 })
+              )
+              yield* recordTokens(command.callId, response.usage.totalTokens)
+              return response.text
+            }).pipe(
+              Effect.retry(bridgeLlmQueryRetryPolicy)
             )
-            yield* recordTokens(command.callId, response.usage.totalTokens)
-            yield* resolveBridgeDeferred(command.bridgeRequestId, response.text)
+
+            yield* resolveBridgeDeferred(command.bridgeRequestId, oneShotResponseText)
           }).pipe(
             Effect.catchAll((error) =>
               failBridgeDeferred(command.bridgeRequestId, error)

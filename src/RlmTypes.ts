@@ -118,7 +118,12 @@ export type RlmEvent = Data.TaggedEnum<{
   }
   SchedulerWarning: {
     readonly completionId: string
-    readonly code: "STALE_COMMAND_DROPPED" | "QUEUE_CLOSED" | "CALL_SCOPE_CLEANUP"
+    readonly code:
+      | "STALE_COMMAND_DROPPED"
+      | "QUEUE_CLOSED"
+      | "CALL_SCOPE_CLEANUP"
+      | "MIXED_SUBMIT_AND_CODE"
+      | "TOOLKIT_DEGRADED"
     readonly message: string
     readonly callId?: CallId
     readonly commandTag?: RlmCommand["_tag"]

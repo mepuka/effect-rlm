@@ -7,6 +7,9 @@ export interface RlmConfigService {
   readonly maxTotalTokens: number | null
   readonly concurrency: number
   readonly eventBufferCapacity: number
+  readonly bridgeToolRetryCount?: number
+  readonly bridgeLlmQueryRetryCount?: number
+  readonly bridgeRetryBaseDelayMs?: number
 }
 
 export class RlmConfig extends Context.Reference<RlmConfig>()(
@@ -18,7 +21,10 @@ export class RlmConfig extends Context.Reference<RlmConfig>()(
       maxLlmCalls: 20,
       maxTotalTokens: null,
       concurrency: 4,
-      eventBufferCapacity: 4096
+      eventBufferCapacity: 4096,
+      bridgeToolRetryCount: 1,
+      bridgeLlmQueryRetryCount: 1,
+      bridgeRetryBaseDelayMs: 50
     })
   }
 ) {}

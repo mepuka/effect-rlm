@@ -1,7 +1,8 @@
 import { Context, Deferred, Effect, Layer, Option, PubSub, Queue, Ref } from "effect"
+import type { CallContext } from "./CallContext"
 import { RlmConfig } from "./RlmConfig"
 import type { SandboxError } from "./RlmError"
-import { BudgetState, type BridgeRequestId, type CallId, type CallState, type RlmCommand, type RlmEvent } from "./RlmTypes"
+import { BudgetState, type BridgeRequestId, type CallId, type RlmCommand, type RlmEvent } from "./RlmTypes"
 
 export interface RlmRuntimeShape {
   readonly completionId: string
@@ -9,7 +10,7 @@ export interface RlmRuntimeShape {
   readonly events: PubSub.PubSub<RlmEvent>
   readonly budgetRef: Ref.Ref<BudgetState>
   readonly llmSemaphore: Effect.Semaphore
-  readonly callStates: Ref.Ref<Map<CallId, CallState>>
+  readonly callStates: Ref.Ref<Map<CallId, CallContext>>
   readonly bridgePending: Ref.Ref<Map<BridgeRequestId, Deferred.Deferred<unknown, SandboxError>>>
 }
 
@@ -39,7 +40,7 @@ export const RlmRuntimeLive = Layer.scoped(
     }))
 
     const llmSemaphore = yield* Effect.makeSemaphore(config.concurrency)
-    const callStates = yield* Ref.make(new Map<CallId, CallState>())
+    const callStates = yield* Ref.make(new Map<CallId, CallContext>())
     const bridgePending = yield* Ref.make(new Map<BridgeRequestId, Deferred.Deferred<unknown, SandboxError>>())
 
     const completionId = `completion-${crypto.randomUUID()}`

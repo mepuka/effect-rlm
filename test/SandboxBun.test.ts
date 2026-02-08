@@ -22,6 +22,7 @@ const testConfig: SandboxConfig["Type"] = {
   executeTimeoutMs: 10_000,
   setVarTimeoutMs: 5_000,
   getVarTimeoutMs: 5_000,
+  listVarTimeoutMs: 5_000,
   shutdownGraceMs: 2_000,
   maxFrameBytes: 4 * 1024 * 1024,
   maxBridgeConcurrency: 4,
@@ -87,6 +88,30 @@ describe("SandboxBun", () => {
     )
 
     expect(result).toBe(15)
+  })
+
+  test("listVariables returns metadata for current variable space", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const factory = yield* SandboxFactory
+          const sandbox = yield* factory.create({ callId: "test" as CallId, depth: 0 })
+
+          yield* sandbox.setVariable("zeta", [1, 2, 3])
+          yield* sandbox.setVariable("alpha", "hello")
+
+          return yield* sandbox.listVariables()
+        })
+      ).pipe(Effect.provide(makeTestLayer()))
+    )
+
+    expect(result.length).toBeGreaterThanOrEqual(2)
+    expect(result[0]!.name).toBe("alpha")
+    expect(result[0]!.type).toBe("string")
+    expect(result[0]!.size).toBe(5)
+    expect(result[1]!.name).toBe("zeta")
+    expect(result[1]!.type).toBe("array")
+    expect(result[1]!.size).toBe(3)
   })
 
   test("code error returns SandboxError", async () => {

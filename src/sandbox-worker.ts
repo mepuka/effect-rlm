@@ -340,6 +340,68 @@ function handleMessage(message: unknown): void {
       break
     }
 
+    case "ListVarsRequest": {
+      const requestId = String(msg.requestId)
+
+      const buildPreview = (value: unknown): { type: string; size?: number; preview: string } => {
+        if (value === null) return { type: "null", preview: "null" }
+        if (value === undefined) return { type: "undefined", preview: "undefined" }
+
+        if (typeof value === "string") {
+          return {
+            type: "string",
+            size: value.length,
+            preview: value.length > 200 ? value.slice(0, 200) + "..." : value
+          }
+        }
+
+        if (Array.isArray(value)) {
+          return {
+            type: "array",
+            size: value.length,
+            preview: `Array(${value.length})`
+          }
+        }
+
+        if (typeof value === "object") {
+          const keys = Object.keys(value as object)
+          return {
+            type: "object",
+            size: keys.length,
+            preview: `{${keys.slice(0, 5).join(", ")}${keys.length > 5 ? ", ..." : ""}}`
+          }
+        }
+
+        if (typeof value === "function") {
+          const fn = value as Function
+          return {
+            type: "function",
+            preview: `[Function ${fn.name || "anonymous"}]`
+          }
+        }
+
+        return {
+          type: typeof value,
+          preview: String(value).slice(0, 200)
+        }
+      }
+
+      const variables = Array.from(vars.entries())
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([name, value]) => {
+          const { type, size, preview } = buildPreview(value)
+          return {
+            name,
+            type,
+            ...(size !== undefined ? { size } : {}),
+            preview
+          }
+        })
+
+      safeSend({ _tag: "ListVarsResult", requestId, variables })
+      break
+    }
+
     case "BridgeResult": {
       const requestId = String(msg.requestId)
       const pending = pendingBridge.get(requestId)

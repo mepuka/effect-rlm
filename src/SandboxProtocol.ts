@@ -18,6 +18,10 @@ export class GetVarRequest extends Schema.TaggedStruct("GetVarRequest", {
   name: Schema.String
 }) {}
 
+export class ListVarsRequest extends Schema.TaggedStruct("ListVarsRequest", {
+  requestId: Schema.String
+}) {}
+
 export class BridgeResult extends Schema.TaggedStruct("BridgeResult", {
   requestId: Schema.String,
   result: Schema.Unknown
@@ -73,6 +77,16 @@ export class GetVarResult extends Schema.TaggedStruct("GetVarResult", {
   value: Schema.Unknown
 }) {}
 
+export class ListVarsResult extends Schema.TaggedStruct("ListVarsResult", {
+  requestId: Schema.String,
+  variables: Schema.Array(Schema.Struct({
+    name: Schema.String,
+    type: Schema.String,
+    size: Schema.optional(Schema.Number),
+    preview: Schema.String
+  }))
+}) {}
+
 export class BridgeCall extends Schema.TaggedStruct("BridgeCall", {
   requestId: Schema.String,
   method: Schema.String,
@@ -90,6 +104,7 @@ export const HostToWorker = Schema.Union(
   ExecRequest,
   SetVar,
   GetVarRequest,
+  ListVarsRequest,
   BridgeResult,
   BridgeFailed,
   Init,
@@ -103,6 +118,7 @@ export const WorkerToHost = Schema.Union(
   SetVarAck,
   SetVarError,
   GetVarResult,
+  ListVarsResult,
   BridgeCall,
   WorkerLog
 )

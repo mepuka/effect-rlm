@@ -9,25 +9,50 @@ export interface FakeModelMetrics {
   calls: number
   readonly prompts: Array<Prompt.Prompt>
   readonly depths: Array<number>
+  readonly toolChoices?: Array<unknown>
+  readonly disableToolCallResolutions?: Array<boolean | undefined>
 }
 
 export interface FakeModelResponse {
-  readonly text: string
+  readonly text?: string
+  readonly error?: string
+  readonly toolCalls?: ReadonlyArray<{
+    readonly name: string
+    readonly params: unknown
+  }>
   readonly totalTokens?: number
 }
 
-const makeMinimalResponse = (text: string, totalTokens?: number) =>
-  new LanguageModel.GenerateTextResponse<{}>([
-    Response.makePart("text", { text }),
-    Response.makePart("finish", {
-      reason: "stop" as const,
-      usage: new Response.Usage({
-        inputTokens: undefined,
-        outputTokens: undefined,
-        totalTokens
-      })
+const makeMinimalResponse = (response: FakeModelResponse) => {
+  const parts: Array<Response.PartEncoded> = []
+
+  if (response.text !== undefined) {
+    parts.push(Response.makePart("text", { text: response.text }))
+  }
+
+  if (response.toolCalls !== undefined) {
+    for (let index = 0; index < response.toolCalls.length; index += 1) {
+      const toolCall = response.toolCalls[index]!
+      parts.push(Response.makePart("tool-call", {
+        id: `tool-call-${index}`,
+        name: toolCall.name,
+        params: toolCall.params,
+        providerExecuted: false
+      }))
+    }
+  }
+
+  parts.push(Response.makePart("finish", {
+    reason: "stop" as const,
+    usage: new Response.Usage({
+      inputTokens: undefined,
+      outputTokens: undefined,
+      totalTokens: response.totalTokens
     })
-  ])
+  }))
+
+  return new LanguageModel.GenerateTextResponse<any>(parts as any)
+}
 
 export const makeFakeRlmModelLayer = (
   responses: ReadonlyArray<FakeModelResponse>,
@@ -38,9 +63,16 @@ export const makeFakeRlmModelLayer = (
   return Layer.succeed(
     RlmModel,
     RlmModel.of({
-      generateText: Effect.fn("FakeRlmModel.generateText")(function*({ prompt, depth }) {
+      generateText: Effect.fn("FakeRlmModel.generateText")(function*({
+        prompt,
+        depth,
+        toolChoice,
+        disableToolCallResolution
+      }) {
         metrics?.prompts.push(prompt)
         metrics?.depths.push(depth)
+        metrics?.toolChoices?.push(toolChoice)
+        metrics?.disableToolCallResolutions?.push(disableToolCallResolution)
         if (metrics) metrics.calls += 1
 
         const scripted = responses[index]
@@ -50,7 +82,11 @@ export const makeFakeRlmModelLayer = (
           return yield* new UnknownRlmError({ message: "Fake model script exhausted" })
         }
 
-        return makeMinimalResponse(scripted.text, scripted.totalTokens)
+        if (scripted.error !== undefined) {
+          return yield* new UnknownRlmError({ message: scripted.error })
+        }
+
+        return makeMinimalResponse(scripted)
       })
     })
   )

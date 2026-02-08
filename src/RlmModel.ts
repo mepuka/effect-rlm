@@ -10,7 +10,11 @@ export interface RlmModelService {
   readonly generateText: (options: {
     readonly prompt: Prompt.Prompt
     readonly depth: number
-  }) => Effect.Effect<LanguageModel.GenerateTextResponse<{}>, RlmError>
+    readonly toolkit?: LanguageModel.GenerateTextOptions<any>["toolkit"]
+    readonly toolChoice?: LanguageModel.GenerateTextOptions<any>["toolChoice"]
+    readonly disableToolCallResolution?: boolean
+    readonly concurrency?: LanguageModel.GenerateTextOptions<any>["concurrency"]
+  }) => Effect.Effect<LanguageModel.GenerateTextResponse<any>, RlmError>
 }
 
 export class RlmModel extends Context.Tag("@recursive-llm/RlmModel")<
@@ -31,9 +35,17 @@ export const makeRlmModelLayer = <R>(options: {
     const threshold = options.depthThreshold ?? 1
 
     return RlmModel.of({
-      generateText: ({ prompt, depth }) => {
+      generateText: ({ prompt, depth, toolkit, toolChoice, disableToolCallResolution, concurrency }) => {
         const lm = depth >= threshold ? subLm : primaryLm
-        return lm.generateText({ prompt }).pipe(
+        return lm.generateText({
+          prompt,
+          ...(toolkit !== undefined ? { toolkit } : {}),
+          ...(toolChoice !== undefined ? { toolChoice } : {}),
+          ...(disableToolCallResolution !== undefined
+            ? { disableToolCallResolution }
+            : {}),
+          ...(concurrency !== undefined ? { concurrency } : {})
+        }).pipe(
           Effect.mapError((err) =>
             new UnknownRlmError({ message: `Model error: ${err}`, cause: err })
           )

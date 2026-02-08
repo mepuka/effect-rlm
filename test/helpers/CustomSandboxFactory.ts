@@ -37,7 +37,18 @@ export const makeCustomSandboxFactoryLayer = (
             Effect.sync(() => {
               vars.set(name, value)
             }),
-          getVariable: (name: string) => Effect.succeed(vars.get(name))
+          getVariable: (name: string) => Effect.succeed(vars.get(name)),
+          listVariables: () =>
+            Effect.succeed(
+              Array.from(vars.entries()).map(([name, value]) => ({
+                name,
+                type: value === null ? "null" : typeof value,
+                ...(typeof value === "string" ? { size: value.length } : {}),
+                preview: typeof value === "string"
+                  ? (value.length > 200 ? value.slice(0, 200) + "..." : value)
+                  : String(value)
+              }))
+            )
         })
       }
     })

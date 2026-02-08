@@ -1,3 +1,5 @@
+import { submitToolDescriptor } from "./SubmitTool"
+
 export interface ToolDescriptor {
   readonly name: string
   readonly description: string
@@ -50,19 +52,26 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   lines.push("```")
   lines.push("")
   lines.push("## Final Answer")
-  lines.push("When done, call FINAL(\"your answer\") with your answer in quotes (single, double, or backtick).")
-  lines.push("- FINAL() ends execution immediately. You MUST have seen execution output confirming your results before calling it.")
-  lines.push("- Do NOT include FINAL() inside a code block — place it as standalone text.")
-  lines.push("- Quotes around your answer are REQUIRED.")
+  lines.push("When done, call SUBMIT with your verified answer.")
+  lines.push(options.outputJsonSchema
+    ? "- For structured output: `SUBMIT({ value: {...} })`."
+    : "- For plain-text output: `SUBMIT({ answer: \"your answer\" })`.")
+  lines.push("- Do NOT provide both `answer` and `value` in one SUBMIT call.")
+  lines.push("- `SUBMIT` ends execution immediately. You MUST have seen execution output confirming your results before calling it.")
+  lines.push("- Do NOT include SUBMIT() inside a code block — place it as standalone text.")
+  lines.push(`- SUBMIT parameters schema: ${JSON.stringify(submitToolDescriptor.parametersJsonSchema)}`)
+  lines.push("- Legacy fallback: `FINAL(\"your answer\")` is still accepted if tool calling is unavailable.")
   lines.push("")
   lines.push("## Rules")
   lines.push("1. EXPLORE FIRST — Read your data with code before processing it. Do not guess at content.")
   lines.push("2. ITERATE — Write small code snippets. Observe output. Then decide next steps.")
-  lines.push("3. VERIFY BEFORE SUBMITTING — If results seem wrong or empty, reconsider your approach before calling FINAL().")
+  lines.push("3. VERIFY BEFORE SUBMITTING — If results seem wrong or empty, reconsider your approach before calling SUBMIT()/FINAL().")
   lines.push("4. HANDLE ERRORS — If your code throws an error, read the error message, fix your code, and try again. Do not guess at an answer after an error.")
-  lines.push("5. MINIMIZE RETYPING — Do not paste context text into code as string literals. Access data through `__vars` and compute over it. Retyping wastes tokens and introduces errors.")
+  lines.push("5. NO MIXED FINALIZATION — Never combine SUBMIT()/FINAL() and executable code in the same response.")
+  lines.push("6. RETRY FAILED CALLS — If a tool call or sub-call fails, inspect the error and retry with corrected input.")
+  lines.push("7. MINIMIZE RETYPING — Do not paste context text into code as string literals. Access data through `__vars` and compute over it. Retyping wastes tokens and introduces errors.")
   if (canRecurse) {
-    lines.push("6. PREFER CODE OVER SUB-CALLS — Use code for aggregation, filtering, and string manipulation. Reserve llm_query for tasks that require semantic understanding.")
+    lines.push("8. PREFER CODE OVER SUB-CALLS — Use code for aggregation, filtering, and string manipulation. Reserve llm_query for tasks that require semantic understanding.")
   }
   lines.push("")
 
@@ -90,7 +99,10 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
 
   if (options.outputJsonSchema) {
     lines.push("## Output Format")
-    lines.push("Your FINAL() answer MUST be valid JSON matching this schema:")
+    lines.push("Primary path: `SUBMIT({ value: {...} })` with valid JSON.")
+    lines.push("Fallback only if tool calling is unavailable: FINAL(`{...}`).")
+    lines.push("Do not output both SUBMIT and FINAL in the same response.")
+    lines.push("Any final payload MUST be valid JSON matching this schema:")
     lines.push(JSON.stringify(options.outputJsonSchema, null, 2))
     lines.push("Use FINAL(`{...}`) with backticks for JSON content.")
     lines.push("")
@@ -102,7 +114,7 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     `LLM calls remaining: ${options.budget.llmCallsRemaining}.`)
 
   if (options.budget.iterationsRemaining <= 0) {
-    lines.push("WARNING: This is your LAST iteration. If you have verified output, call FINAL() now. Otherwise, write one small verification snippet — the extract fallback will finalize from your work if needed.")
+    lines.push("WARNING: This is your LAST iteration. If you have verified output, call SUBMIT() now. Otherwise, write one small verification snippet — the extract fallback will finalize from your work if needed.")
   }
 
   return lines.join("\n")
@@ -115,17 +127,21 @@ export const buildExtractSystemPrompt = (outputJsonSchema?: object): string => {
   lines.push("Review the conversation above and extract the final answer to the original query.")
 
   if (outputJsonSchema) {
-    lines.push("Respond with FINAL(`{...}`) and nothing else.")
-    lines.push("Use backticks so JSON is not escaped.")
+    lines.push("Primary path: respond with SUBMIT({ value: {...} }) and nothing else.")
+    lines.push("Fallback only if tool calling is unavailable: respond with FINAL(`{...}`) and nothing else.")
+    lines.push("Do not output both SUBMIT and FINAL.")
+    lines.push("Use backticks for FINAL JSON so content is not escaped.")
     lines.push("")
     lines.push("Your answer MUST be valid JSON matching this schema:")
     lines.push(JSON.stringify(outputJsonSchema, null, 2))
   } else {
-    lines.push("Respond with FINAL(\"your answer\") and nothing else.")
+    lines.push("Primary path: respond with SUBMIT({ answer: \"your answer\" }) and nothing else.")
+    lines.push("Fallback only if tool calling is unavailable: respond with FINAL(\"your answer\") and nothing else.")
+    lines.push("Do not output both SUBMIT and FINAL.")
   }
 
   return lines.join("\n")
 }
 
 export const buildOneShotSystemPrompt = (): string =>
-  "Answer the query directly and concisely. Do not use code blocks, FINAL(), or any special formatting. Return your answer as plain text."
+  "Answer the query directly and concisely. Do not use code blocks, SUBMIT(), FINAL(), or any special formatting. Return your answer as plain text."

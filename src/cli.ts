@@ -6,7 +6,7 @@ import { Effect, Layer, Match, Redacted, Stream } from "effect"
 import { makeAnthropicRlmModel, makeOpenAiRlmModel } from "./RlmModel"
 import { Rlm, rlmBunLayer } from "./Rlm"
 import { RlmConfig } from "./RlmConfig"
-import { renderEvent, type RenderOptions } from "./RlmRenderer"
+import { formatEvent, type RenderOptions } from "./RlmRenderer"
 
 // --- Arg parsing ---
 
@@ -19,6 +19,7 @@ interface CliArgs {
   subModel?: string
   maxIterations?: number
   maxDepth?: number
+  maxLlmCalls?: number
   quiet: boolean
   noColor: boolean
 }
@@ -30,10 +31,11 @@ Options:
   --context <text>          Context string
   --context-file <path>     Read context from file
   --provider <name>         Provider: anthropic (default), openai
-  --model <name>            Model name (default: claude-sonnet-4-20250514)
+  --model <name>            Model name (default: claude-sonnet-4-5-20250929)
   --sub-model <name>        Sub-model for recursive calls
-  --max-iterations <n>      Max iterations (default: 10)
+  --max-iterations <n>      Max iterations (default: 50)
   --max-depth <n>           Max recursion depth (default: 1)
+  --max-llm-calls <n>       Max total LLM calls (default: 200)
   --quiet                   Only show final answer and errors
   --no-color                Disable ANSI colors
 
@@ -53,7 +55,7 @@ const parseArgs = (): CliArgs | null => {
     query: "",
     context: "",
     provider: "anthropic",
-    model: "claude-sonnet-4-20250514",
+    model: "claude-sonnet-4-5-20250929",
     quiet: false,
     noColor: false
   }
@@ -92,6 +94,9 @@ const parseArgs = (): CliArgs | null => {
         break
       case "--max-depth":
         result.maxDepth = parseInt(args[++i] ?? "1", 10)
+        break
+      case "--max-llm-calls":
+        result.maxLlmCalls = parseInt(args[++i] ?? "50", 10)
         break
       case "--quiet":
         result.quiet = true
@@ -139,7 +144,8 @@ const main = (cliArgs: CliArgs) =>
         { answer: "", failed: false },
         (state, event) =>
           Effect.sync(() => {
-            renderEvent(event, process.stderr, renderOpts)
+            const formatted = formatEvent(event, renderOpts)
+            if (formatted) process.stderr.write(formatted)
             return Match.value(event).pipe(
               Match.tag("CallFinalized", (e) =>
                 e.depth === 0 ? { ...state, answer: e.answer } : state),
@@ -197,9 +203,9 @@ const buildRlmModelLayer = (cliArgs: CliArgs): Layer.Layer<RlmModel, never, neve
 
 const buildLayer = (cliArgs: CliArgs): Layer.Layer<Rlm, never, never> => {
   const configLayer = Layer.succeed(RlmConfig, {
-    maxIterations: cliArgs.maxIterations ?? 10,
+    maxIterations: cliArgs.maxIterations ?? 50,
     maxDepth: cliArgs.maxDepth ?? 1,
-    maxLlmCalls: 20,
+    maxLlmCalls: cliArgs.maxLlmCalls ?? 200,
     maxTotalTokens: null,
     concurrency: 4,
     eventBufferCapacity: 4096

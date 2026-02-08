@@ -80,7 +80,7 @@ const completeInternal = Effect.fn("Rlm.complete")(function*(
 
   return yield* Schema.decodeUnknown(Schema.parseJson(options.outputSchema))(raw).pipe(
     Effect.mapError((e) => new OutputValidationError({
-      message: `FINAL() content does not match output schema: ${String(e)}`,
+      message: `Submitted final content does not match output schema: ${String(e)}`,
       raw
     }))
   )
