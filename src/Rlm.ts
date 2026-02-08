@@ -1,5 +1,6 @@
 import { Context, Effect, Layer, PubSub, Schema, Stream } from "effect"
 import { BridgeHandlerLive } from "./BridgeHandler"
+import { RlmConfig } from "./RlmConfig"
 import { RlmModel } from "./RlmModel"
 import type { RlmError } from "./RlmError"
 import { OutputValidationError } from "./RlmError"
@@ -7,7 +8,7 @@ import { RlmRuntime, RlmRuntimeLive } from "./Runtime"
 import { CallId, RlmEvent } from "./RlmTypes"
 import type { RunSchedulerOptions } from "./Scheduler"
 import { runScheduler } from "./Scheduler"
-import { SandboxFactory } from "./Sandbox"
+import { SandboxConfig, SandboxFactory } from "./Sandbox"
 import { SandboxBunLive } from "./SandboxBun"
 import type { RlmToolAny } from "./RlmTool"
 import { JSONSchema } from "effect"
@@ -96,10 +97,14 @@ export const rlmLayer: Layer.Layer<Rlm, never, RlmModel | SandboxFactory> = Laye
   Effect.gen(function*() {
     const rlmModel = yield* RlmModel
     const sandboxFactory = yield* SandboxFactory
+    const config = yield* RlmConfig
+    const sandboxConfig = yield* SandboxConfig
 
     const dependencies = Layer.mergeAll(
       Layer.succeed(RlmModel, rlmModel),
-      Layer.succeed(SandboxFactory, sandboxFactory)
+      Layer.succeed(SandboxFactory, sandboxFactory),
+      Layer.succeed(RlmConfig, config),
+      Layer.succeed(SandboxConfig, sandboxConfig)
     )
 
     return Rlm.of({
@@ -119,9 +124,15 @@ export const rlmBunLayer: Layer.Layer<Rlm, never, RlmModel> = Layer.effect(
   Rlm,
   Effect.gen(function*() {
     const rlmModel = yield* RlmModel
+    const config = yield* RlmConfig
+    const sandboxConfig = yield* SandboxConfig
 
-    // Shared dependency (not per-call)
-    const rlmModelLayer = Layer.succeed(RlmModel, rlmModel)
+    // Shared dependencies (captured at layer-build time, not per-call)
+    const sharedLayers = Layer.mergeAll(
+      Layer.succeed(RlmModel, rlmModel),
+      Layer.succeed(RlmConfig, config),
+      Layer.succeed(SandboxConfig, sandboxConfig)
+    )
 
     // Per-call layer constructor: fresh RlmRuntime → BridgeHandler → SandboxFactory
     const makePerCallDeps = () => {
@@ -131,7 +142,7 @@ export const rlmBunLayer: Layer.Layer<Rlm, never, RlmModel> = Layer.effect(
           Layer.provideMerge(BridgeHandlerLive, RlmRuntimeLive)
         )
       )
-      return Layer.provideMerge(perCallLayer, rlmModelLayer)
+      return Layer.provideMerge(perCallLayer, sharedLayers)
     }
 
     return Rlm.of({
