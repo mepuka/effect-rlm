@@ -236,7 +236,8 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         query: callState.query,
         contextLength: callState.context.length,
         contextPreview: callState.context.slice(0, CONTEXT_PREVIEW_CHARS),
-        transcript
+        transcript,
+        enablePromptCaching: config.enablePromptCaching
       })
       const isSubCall = callState.parentBridgeRequestId !== undefined
       const response = yield* withLlmPermit(
@@ -383,7 +384,8 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             query: callState.query,
             contextLength: callState.context.length,
             contextPreview: callState.context.slice(0, CONTEXT_PREVIEW_CHARS),
-            transcript
+            transcript,
+            enablePromptCaching: config.enablePromptCaching
           })
 
           const response = yield* withLlmPermit(
@@ -430,7 +432,11 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             usage: {
               ...(response.usage.inputTokens !== undefined ? { inputTokens: response.usage.inputTokens } : {}),
               ...(response.usage.outputTokens !== undefined ? { outputTokens: response.usage.outputTokens } : {}),
-              ...(response.usage.totalTokens !== undefined ? { totalTokens: response.usage.totalTokens } : {})
+              ...(response.usage.totalTokens !== undefined ? { totalTokens: response.usage.totalTokens } : {}),
+              ...(response.usage.reasoningTokens !== undefined ? { reasoningTokens: response.usage.reasoningTokens } : {}),
+              ...(response.usage.cachedInputTokens !== undefined
+                ? { cachedInputTokens: response.usage.cachedInputTokens }
+                : {})
             }
           }))
 
@@ -553,7 +559,8 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           const oneShotPrompt = buildOneShotPrompt({
             systemPrompt: buildOneShotSystemPrompt(),
             query,
-            context
+            context,
+            enablePromptCaching: config.enablePromptCaching
           })
 
           yield* reserveLlmCall(command.callId)

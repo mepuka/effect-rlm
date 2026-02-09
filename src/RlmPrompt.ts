@@ -4,6 +4,24 @@ import type { TranscriptEntry } from "./RlmTypes"
 export const MAX_OUTPUT_CHARS = 4_000
 export const CONTEXT_PREVIEW_CHARS = 200
 export const MAX_ONESHOT_CONTEXT_CHARS = 8_000
+export const ANTHROPIC_EPHEMERAL_CACHE_CONTROL = { type: "ephemeral" } as const
+
+const promptCacheOptions: Prompt.ProviderOptions = {
+  anthropic: {
+    cacheControl: ANTHROPIC_EPHEMERAL_CACHE_CONTROL
+  }
+}
+
+const withPromptCacheOptions = <T extends Prompt.MessageEncoded>(
+  message: T,
+  enabled: boolean
+): T =>
+  enabled
+    ? {
+        ...message,
+        options: promptCacheOptions
+      }
+    : message
 
 export const truncateOutput = (output: string, maxChars = MAX_OUTPUT_CHARS): string => {
   if (output.length <= maxChars) return output
@@ -22,12 +40,17 @@ export interface BuildReplPromptOptions {
   readonly contextLength: number
   readonly contextPreview: string
   readonly transcript: ReadonlyArray<TranscriptEntry>
+  readonly enablePromptCaching?: boolean
 }
 
 export const buildReplPrompt = (options: BuildReplPromptOptions): Prompt.Prompt => {
+  const enablePromptCaching = options.enablePromptCaching ?? true
   const messages: Array<Prompt.MessageEncoded> = []
 
-  messages.push({ role: "system", content: options.systemPrompt })
+  messages.push(withPromptCacheOptions({
+    role: "system",
+    content: options.systemPrompt
+  }, enablePromptCaching))
 
   const isFirstIteration = options.transcript.length === 0
   const safeguard = isFirstIteration && options.contextLength > 0
@@ -37,7 +60,12 @@ export const buildReplPrompt = (options: BuildReplPromptOptions): Prompt.Prompt 
   const userContent = options.contextLength > 0
     ? `${safeguard}${options.query}\n\n[Context available in __vars.context (${options.contextLength} chars). Preview: ${options.contextPreview}...]`
     : options.query
-  messages.push({ role: "user", content: userContent })
+  messages.push(withPromptCacheOptions({
+    role: "user",
+    content: userContent
+  }, enablePromptCaching))
+
+  let lastCacheableTranscriptMessageIndex: number | undefined
 
   for (const entry of options.transcript) {
     messages.push({ role: "assistant", content: entry.assistantResponse })
@@ -49,7 +77,17 @@ export const buildReplPrompt = (options: BuildReplPromptOptions): Prompt.Prompt 
         role: "user",
         content: `[Execution Output]\n${outputText}`
       })
+      // Assistant text blocks are not cacheable in the Anthropic adapter.
+      lastCacheableTranscriptMessageIndex = messages.length - 1
     }
+  }
+
+  if (
+    enablePromptCaching &&
+    lastCacheableTranscriptMessageIndex !== undefined
+  ) {
+    const lastCacheableTranscriptMessage = messages[lastCacheableTranscriptMessageIndex]!
+    messages[lastCacheableTranscriptMessageIndex] = withPromptCacheOptions(lastCacheableTranscriptMessage, true)
   }
 
   return Prompt.make(messages)
@@ -59,11 +97,16 @@ export interface BuildOneShotPromptOptions {
   readonly systemPrompt: string
   readonly query: string
   readonly context: string
+  readonly enablePromptCaching?: boolean
 }
 
 export const buildOneShotPrompt = (options: BuildOneShotPromptOptions): Prompt.Prompt => {
+  const enablePromptCaching = options.enablePromptCaching ?? true
   const messages: Array<Prompt.MessageEncoded> = []
-  messages.push({ role: "system", content: options.systemPrompt })
+  messages.push(withPromptCacheOptions({
+    role: "system",
+    content: options.systemPrompt
+  }, enablePromptCaching))
   const boundedContext = truncateOutput(options.context, MAX_ONESHOT_CONTEXT_CHARS)
   const userContent = boundedContext
     ? `${options.query}\n\nContext: ${boundedContext}`
@@ -78,17 +121,24 @@ export interface BuildExtractPromptOptions {
   readonly contextLength: number
   readonly contextPreview: string
   readonly transcript: ReadonlyArray<TranscriptEntry>
+  readonly enablePromptCaching?: boolean
 }
 
 export const buildExtractPrompt = (options: BuildExtractPromptOptions): Prompt.Prompt => {
+  const enablePromptCaching = options.enablePromptCaching ?? true
   const messages: Array<Prompt.MessageEncoded> = []
 
-  messages.push({ role: "system", content: options.systemPrompt })
+  messages.push(withPromptCacheOptions({
+    role: "system",
+    content: options.systemPrompt
+  }, enablePromptCaching))
 
   const userContent = options.contextLength > 0
     ? `${options.query}\n\n[Context was available in __vars.context (${options.contextLength} chars). Preview: ${options.contextPreview}...]`
     : options.query
   messages.push({ role: "user", content: userContent })
+
+  let lastCacheableTranscriptMessageIndex: number | undefined
 
   for (const entry of options.transcript) {
     messages.push({ role: "assistant", content: entry.assistantResponse })
@@ -100,7 +150,17 @@ export const buildExtractPrompt = (options: BuildExtractPromptOptions): Prompt.P
         role: "user",
         content: `[Execution Output]\n${outputText}`
       })
+      // Assistant text blocks are not cacheable in the Anthropic adapter.
+      lastCacheableTranscriptMessageIndex = messages.length - 1
     }
+  }
+
+  if (
+    enablePromptCaching &&
+    lastCacheableTranscriptMessageIndex !== undefined
+  ) {
+    const lastCacheableTranscriptMessage = messages[lastCacheableTranscriptMessageIndex]!
+    messages[lastCacheableTranscriptMessageIndex] = withPromptCacheOptions(lastCacheableTranscriptMessage, true)
   }
 
   return Prompt.make(messages)

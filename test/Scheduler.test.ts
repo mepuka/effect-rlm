@@ -25,6 +25,7 @@ const defaultConfig: RlmConfigService = {
   maxBatchQueries: 32,
   eventBufferCapacity: 4096,
   maxExecutionOutputChars: 8_000,
+  enablePromptCaching: true,
   primaryTarget: {
     provider: "anthropic",
     model: "claude-sonnet-4-5-20250929"

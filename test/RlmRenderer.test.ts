@@ -362,7 +362,7 @@ describe("RlmRenderer", () => {
     expect(out).toContain("in:200")
     expect(out).toContain("out:100")
     expect(out).toContain("reason:50")
-    expect(out).toContain("cached:180")
+    expect(out).toContain("cache:180")
     expect(out).toContain("= 350")
   })
 

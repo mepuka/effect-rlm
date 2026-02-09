@@ -64,6 +64,10 @@ const maxLlmCalls = Options.integer("max-llm-calls").pipe(
   Options.withDescription("Max total LLM calls")
 )
 
+const noPromptCaching = Options.boolean("no-prompt-caching").pipe(
+  Options.withDescription("Disable Anthropic prompt caching breakpoints")
+)
+
 const quiet = Options.boolean("quiet").pipe(
   Options.withDescription("Only show final answer and errors")
 )
@@ -89,6 +93,7 @@ const commandConfig = {
   maxIterations,
   maxDepth,
   maxLlmCalls,
+  noPromptCaching,
   quiet,
   noColor,
   nlpTools

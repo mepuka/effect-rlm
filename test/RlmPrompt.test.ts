@@ -10,6 +10,20 @@ import {
 } from "../src/RlmPrompt"
 import { TranscriptEntry } from "../src/RlmTypes"
 
+const hasEphemeralCacheControl = (message: unknown): boolean => {
+  if (typeof message !== "object" || message === null) return false
+  const options = (message as {
+    readonly options?: {
+      readonly anthropic?: {
+        readonly cacheControl?: {
+          readonly type?: unknown
+        }
+      }
+    }
+  }).options
+  return options?.anthropic?.cacheControl?.type === "ephemeral"
+}
+
 describe("truncateOutput", () => {
   test("passes through output under limit", () => {
     expect(truncateOutput("hello", 100)).toBe("hello")
@@ -346,5 +360,138 @@ describe("buildExtractPrompt", () => {
       ? (userMsg.content as ReadonlyArray<{ readonly text: string }>)[0]!.text
       : ""
     expect(textContent).toBe("hello")
+  })
+})
+
+describe("prompt caching breakpoints", () => {
+  test("buildReplPrompt marks system, initial user, and last stable transcript message", () => {
+    const prompt = buildReplPrompt({
+      systemPrompt: "system",
+      query: "q",
+      contextLength: 0,
+      contextPreview: "",
+      transcript: [
+        new TranscriptEntry({
+          assistantResponse: "step 1",
+          executionOutput: "out 1"
+        }),
+        new TranscriptEntry({
+          assistantResponse: "step 2",
+          executionOutput: "out 2"
+        })
+      ]
+    })
+
+    expect(hasEphemeralCacheControl(prompt.content[0]!)).toBe(true)
+    expect(hasEphemeralCacheControl(prompt.content[1]!)).toBe(true)
+
+    // Transcript messages:
+    // [2] assistant(step1), [3] user(out1), [4] assistant(step2), [5] user(out2)
+    expect(hasEphemeralCacheControl(prompt.content[2]!)).toBe(false)
+    expect(hasEphemeralCacheControl(prompt.content[3]!)).toBe(false)
+    expect(hasEphemeralCacheControl(prompt.content[4]!)).toBe(false)
+    expect(hasEphemeralCacheControl(prompt.content[5]!)).toBe(true)
+  })
+
+  test("buildReplPrompt keeps last cacheable transcript message when latest transcript has no execution output", () => {
+    const prompt = buildReplPrompt({
+      systemPrompt: "system",
+      query: "q",
+      contextLength: 0,
+      contextPreview: "",
+      transcript: [
+        new TranscriptEntry({
+          assistantResponse: "step 1",
+          executionOutput: "out 1"
+        }),
+        new TranscriptEntry({
+          assistantResponse: "step 2"
+        })
+      ]
+    })
+
+    // Transcript messages:
+    // [2] assistant(step1), [3] user(out1), [4] assistant(step2)
+    expect(hasEphemeralCacheControl(prompt.content[4]!)).toBe(false)
+    expect(hasEphemeralCacheControl(prompt.content[3]!)).toBe(true)
+  })
+
+  test("buildReplPrompt omits all cache breakpoints when disabled", () => {
+    const prompt = buildReplPrompt({
+      systemPrompt: "system",
+      query: "q",
+      contextLength: 0,
+      contextPreview: "",
+      transcript: [
+        new TranscriptEntry({
+          assistantResponse: "step 1",
+          executionOutput: "out 1"
+        })
+      ],
+      enablePromptCaching: false
+    })
+
+    for (const message of prompt.content) {
+      expect(hasEphemeralCacheControl(message)).toBe(false)
+    }
+  })
+
+  test("buildOneShotPrompt marks system message when enabled", () => {
+    const prompt = buildOneShotPrompt({
+      systemPrompt: "system",
+      query: "q",
+      context: "ctx"
+    })
+
+    expect(hasEphemeralCacheControl(prompt.content[0]!)).toBe(true)
+    expect(hasEphemeralCacheControl(prompt.content[1]!)).toBe(false)
+  })
+
+  test("buildExtractPrompt marks system and last stable transcript message", () => {
+    const prompt = buildExtractPrompt({
+      systemPrompt: "system",
+      query: "q",
+      contextLength: 0,
+      contextPreview: "",
+      transcript: [
+        new TranscriptEntry({
+          assistantResponse: "step 1",
+          executionOutput: "out 1"
+        }),
+        new TranscriptEntry({
+          assistantResponse: "step 2",
+          executionOutput: "out 2"
+        })
+      ]
+    })
+
+    expect(hasEphemeralCacheControl(prompt.content[0]!)).toBe(true)
+    // [5] is last transcript message (user execution output)
+    expect(hasEphemeralCacheControl(prompt.content[5]!)).toBe(true)
+    expect(hasEphemeralCacheControl(prompt.content[1]!)).toBe(false)
+    expect(hasEphemeralCacheControl(prompt.content[3]!)).toBe(false)
+  })
+
+  test("buildExtractPrompt keeps last cacheable transcript message when latest transcript has no execution output", () => {
+    const prompt = buildExtractPrompt({
+      systemPrompt: "system",
+      query: "q",
+      contextLength: 0,
+      contextPreview: "",
+      transcript: [
+        new TranscriptEntry({
+          assistantResponse: "step 1",
+          executionOutput: "out 1"
+        }),
+        new TranscriptEntry({
+          assistantResponse: "step 2"
+        })
+      ]
+    })
+
+    // Transcript messages:
+    // [2] assistant(step1), [3] user(out1), [4] assistant(step2)
+    expect(hasEphemeralCacheControl(prompt.content[3]!)).toBe(true)
+    expect(hasEphemeralCacheControl(prompt.content[4]!)).toBe(false)
   })
 })

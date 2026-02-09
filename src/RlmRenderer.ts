@@ -123,7 +123,7 @@ const usageBadge = (usage?: {
     parts.push(`reason:${usage.reasoningTokens}`)
   }
   if (usage.cachedInputTokens !== undefined && usage.cachedInputTokens > 0) {
-    parts.push(`cached:${usage.cachedInputTokens}`)
+    parts.push(`cache:${usage.cachedInputTokens}`)
   }
   const total = usage.totalTokens !== undefined && usage.totalTokens > 0
     ? usage.totalTokens

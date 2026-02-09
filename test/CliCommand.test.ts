@@ -101,6 +101,17 @@ describe("Effect CLI command", () => {
     })
   })
 
+  test("maps --no-prompt-caching to enablePromptCaching=false", async () => {
+    const captured = await runWithCapture([
+      "bun",
+      "src/cli.ts",
+      "summarize this",
+      "--no-prompt-caching"
+    ])
+
+    expect(captured?.enablePromptCaching).toBe(false)
+  })
+
   test("uses last delegation flag when both are present", async () => {
     const captured = await runWithCapture([
       "bun",

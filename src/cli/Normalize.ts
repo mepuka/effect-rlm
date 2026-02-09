@@ -15,6 +15,7 @@ export interface ParsedCliConfig {
   readonly maxIterations: Option.Option<number>
   readonly maxDepth: Option.Option<number>
   readonly maxLlmCalls: Option.Option<number>
+  readonly noPromptCaching: boolean
   readonly quiet: boolean
   readonly noColor: boolean
   readonly nlpTools: boolean
@@ -76,6 +77,7 @@ export const normalizeCliArgs = (
     const maxIterations = toUndefined(parsed.maxIterations)
     const maxDepth = toUndefined(parsed.maxDepth)
     const maxLlmCalls = toUndefined(parsed.maxLlmCalls)
+    const enablePromptCaching = parsed.noPromptCaching ? false : undefined
     const subDelegationEnabled = resolveSubDelegationEnabled(
       rawArgs,
       parsed.subDelegationEnabled,
@@ -114,7 +116,8 @@ export const normalizeCliArgs = (
       ...(subDelegationDepthThreshold !== undefined ? { subDelegationDepthThreshold } : {}),
       ...(maxIterations !== undefined ? { maxIterations } : {}),
       ...(maxDepth !== undefined ? { maxDepth } : {}),
-      ...(maxLlmCalls !== undefined ? { maxLlmCalls } : {})
+      ...(maxLlmCalls !== undefined ? { maxLlmCalls } : {}),
+      ...(enablePromptCaching !== undefined ? { enablePromptCaching } : {})
     }
 
     return cliArgs

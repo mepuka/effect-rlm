@@ -77,5 +77,15 @@ describe("CliLayer config mapping", () => {
     expect(config.maxIterations).toBe(50)
     expect(config.maxDepth).toBe(1)
     expect(config.maxLlmCalls).toBe(200)
+    expect(config.enablePromptCaching).toBe(true)
+  })
+
+  test("maps explicit prompt caching disable", () => {
+    const config = makeCliConfig({
+      ...baseArgs,
+      enablePromptCaching: false
+    })
+
+    expect(config.enablePromptCaching).toBe(false)
   })
 })

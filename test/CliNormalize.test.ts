@@ -20,6 +20,7 @@ const baseParsed: ParsedCliConfig = {
   maxIterations: Option.none(),
   maxDepth: Option.none(),
   maxLlmCalls: Option.none(),
+  noPromptCaching: false,
   quiet: false,
   noColor: false,
   nlpTools: false
@@ -58,10 +59,11 @@ describe("CLI normalization", () => {
         maxIterations: Option.some(70),
         maxDepth: Option.some(4),
         maxLlmCalls: Option.some(140),
+        noPromptCaching: true,
         quiet: true,
         noColor: true
       },
-      ["query", "--sub-delegation-enabled"]
+      ["query", "--sub-delegation-enabled", "--no-prompt-caching"]
     )
 
     expect(cliArgs).toEqual({
@@ -76,6 +78,7 @@ describe("CLI normalization", () => {
       maxIterations: 70,
       maxDepth: 4,
       maxLlmCalls: 140,
+      enablePromptCaching: false,
       quiet: true,
       noColor: true,
       nlpTools: false
@@ -104,6 +107,11 @@ describe("CLI normalization", () => {
   test("leaves delegation undefined when neither delegation flag is present", async () => {
     const cliArgs = await normalize(baseParsed, ["query"])
     expect(cliArgs.subDelegationEnabled).toBeUndefined()
+  })
+
+  test("leaves prompt caching default when no disable flag is present", async () => {
+    const cliArgs = await normalize(baseParsed, ["query"])
+    expect(cliArgs.enablePromptCaching).toBeUndefined()
   })
 
   test("fails when delegation is explicitly enabled without sub model", async () => {

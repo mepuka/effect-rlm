@@ -20,6 +20,7 @@ export interface CliArgs {
   maxIterations?: number
   maxDepth?: number
   maxLlmCalls?: number
+  enablePromptCaching?: boolean
   quiet: boolean
   noColor: boolean
   nlpTools: boolean
@@ -89,6 +90,7 @@ export const makeCliConfig = (cliArgs: CliArgs): RlmConfigService => {
     maxBatchQueries: 32,
     eventBufferCapacity: 4096,
     maxExecutionOutputChars: 8_000,
+    enablePromptCaching: cliArgs.enablePromptCaching ?? true,
     primaryTarget: {
       provider: cliArgs.provider,
       model: cliArgs.model

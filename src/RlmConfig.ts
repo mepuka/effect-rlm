@@ -22,6 +22,7 @@ export interface RlmConfigService {
   readonly maxBatchQueries: number
   readonly eventBufferCapacity: number
   readonly maxExecutionOutputChars: number
+  readonly enablePromptCaching: boolean
   readonly primaryTarget: RlmModelTarget
   readonly subTarget?: RlmModelTarget
   readonly subLlmDelegation: SubLlmDelegationConfig
@@ -44,6 +45,7 @@ export class RlmConfig extends Context.Reference<RlmConfig>()(
       maxBatchQueries: 32,
       eventBufferCapacity: 4096,
       maxExecutionOutputChars: 8_000,
+      enablePromptCaching: true,
       primaryTarget: {
         provider: "anthropic",
         model: "claude-sonnet-4-5-20250929"
