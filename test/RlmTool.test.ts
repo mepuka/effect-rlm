@@ -95,6 +95,24 @@ describe("RlmTool", () => {
     expect(tool.timeoutMs).toBe(60_000)
   })
 
+  test("usageExamples are preserved when provided", () => {
+    const tool = make("sampleTool", {
+      description: "Example tool",
+      parameters: {
+        input: Schema.String
+      },
+      returns: Schema.String,
+      usageExamples: [
+        'const result = await sampleTool("hello")'
+      ],
+      handler: ({ input }) => Effect.succeed(input)
+    })
+
+    expect(tool.usageExamples).toEqual([
+      'const result = await sampleTool("hello")'
+    ])
+  })
+
   test("handle() with no parameters", async () => {
     const tool = make("ping", {
       description: "Ping",

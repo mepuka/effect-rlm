@@ -31,6 +31,7 @@ export interface RlmToolAny {
   readonly parameterNames: ReadonlyArray<string>
   readonly parametersJsonSchema: object
   readonly returnsJsonSchema: object
+  readonly usageExamples?: ReadonlyArray<string>
   readonly timeoutMs: number
   readonly handle: (args: ReadonlyArray<unknown>) => Effect.Effect<unknown, RlmToolError>
 }
@@ -41,6 +42,7 @@ export const make = <P extends Schema.Struct.Fields, A, I>(
     readonly description: string
     readonly parameters: P
     readonly returns: Schema.Schema<A, I, never>
+    readonly usageExamples?: ReadonlyArray<string>
     readonly timeoutMs?: number
     readonly handler: (params: Schema.Struct.Type<P>) => Effect.Effect<A, RlmToolError>
   }
@@ -63,6 +65,9 @@ export const make = <P extends Schema.Struct.Fields, A, I>(
     parameterNames,
     parametersJsonSchema,
     returnsJsonSchema,
+    ...(options.usageExamples !== undefined && options.usageExamples.length > 0
+      ? { usageExamples: options.usageExamples }
+      : {}),
     timeoutMs,
     handle: (args: ReadonlyArray<unknown>): Effect.Effect<unknown, RlmToolError> => {
       // Build object from positional args + parameter names

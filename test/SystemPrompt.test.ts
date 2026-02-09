@@ -118,6 +118,24 @@ describe("SystemPrompt", () => {
     expect(prompt).toContain("Search the web")
   })
 
+  test("REPL prompt includes NLP guidance when NLP tools are available", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      tools: [{
+        name: "DocumentStats",
+        description: "Compute document statistics",
+        parameterNames: ["text"],
+        parametersJsonSchema: { type: "object" },
+        returnsJsonSchema: { type: "object" }
+      }]
+    })
+    expect(prompt).toContain("### Use NLP tools for:")
+    expect(prompt).toContain("DocumentStats")
+    expect(prompt).toContain("ChunkBySentences")
+    expect(prompt).toContain("RankByRelevance")
+    expect(prompt).toContain("ExtractEntities")
+  })
+
   test("REPL prompt omits tool section when no tools", () => {
     const prompt = buildReplSystemPrompt(baseOptions)
     expect(prompt).not.toContain("## Available Tools")
@@ -142,6 +160,7 @@ describe("SystemPrompt", () => {
     const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1, sandboxMode: "strict" })
     expect(prompt).not.toContain("llm_query")
     expect(prompt).not.toContain("## Recursive Sub-calls")
+    expect(prompt).toContain("Strict mode: bridge calls are disabled")
   })
 
   test("strict mode suppresses tools section", () => {

@@ -6,6 +6,7 @@ export interface ToolDescriptor {
   readonly parameterNames: ReadonlyArray<string>
   readonly parametersJsonSchema: object
   readonly returnsJsonSchema: object
+  readonly usageExamples?: ReadonlyArray<string>
 }
 
 export interface ReplSystemPromptOptions {
@@ -27,6 +28,20 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   const isStrict = options.sandboxMode === "strict"
   const canRecurse = !isStrict && options.depth < options.maxDepth
   const submitInvocationSchema = buildSubmitInvocationSchema(options.outputJsonSchema)
+  const nlpToolNames = new Set([
+    "DocumentStats",
+    "ChunkBySentences",
+    "RankByRelevance",
+    "ExtractEntities",
+    "Tokenize",
+    "Sentences",
+    "ExtractKeywords",
+    "TextSimilarity",
+    "TransformText"
+  ])
+  const availableNlpTools = (options.tools ?? []).filter((tool) =>
+    nlpToolNames.has(tool.name)
+  )
   const lines: Array<string> = []
 
   lines.push("You are a recursive problem-solving agent with access to a code sandbox.")
@@ -35,7 +50,11 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   } else {
     lines.push("Use code for both mechanical and semantic operations in this environment; recursive sub-calls are unavailable.")
   }
-  lines.push("Choose the tool that best matches the task while respecting iteration and LLM-call budgets.")
+  if (isStrict) {
+    lines.push("Strict mode: bridge calls are disabled. Solve with code only.")
+  } else {
+    lines.push("Choose the tool that best matches the task while respecting iteration and LLM-call budgets.")
+  }
   lines.push("")
   lines.push("## Variable Space")
   lines.push("Your query is in `__vars.query` and any context is in `__vars.context`.")
@@ -177,12 +196,26 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
 
   if (!isStrict && options.tools && options.tools.length > 0) {
     lines.push("## Available Tools")
+    if (availableNlpTools.length > 0) {
+      lines.push("### Use NLP tools for:")
+      lines.push("- Quick document profiling before planning (`DocumentStats`).")
+      lines.push("- Sentence-aligned chunking before `llm_query_batched` (`ChunkBySentences`).")
+      lines.push("- Relevance filtering before expensive semantic calls (`RankByRelevance`).")
+      lines.push("- Named entity extraction with offsets (`ExtractEntities`).")
+      lines.push("- Prefer these tools over custom regex heuristics when the tool already matches the task.")
+    }
     for (const tool of options.tools) {
       const params = tool.parameterNames.join(", ")
       lines.push(`\`${tool.name}(${params})\` — ${tool.description}`)
       lines.push(`  Parameters: ${JSON.stringify(tool.parametersJsonSchema)}`)
       lines.push(`  Returns: ${JSON.stringify(tool.returnsJsonSchema)}`)
       lines.push(`  Usage: \`const result = await ${tool.name}(${tool.parameterNames.map(p => `<${p}>`).join(", ")})\` (requires await)`)
+      if (tool.usageExamples && tool.usageExamples.length > 0) {
+        lines.push(`  Examples:`)
+        for (const ex of tool.usageExamples) {
+          lines.push(`    \`${ex}\``)
+        }
+      }
     }
     lines.push("")
   }

@@ -1,4 +1,4 @@
-import { Deferred, Duration, Effect, Exit, Match, Option, Queue, Ref, Schedule, Scope, Stream } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Match, Option, Queue, Ref, Schedule, Scope, Stream } from "effect"
 import { consumeIteration, recordTokens, reserveLlmCall, snapshot, withLlmPermit } from "./Budget"
 import {
   appendTranscript,
@@ -95,11 +95,14 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       const callScope = yield* Scope.make()
 
       yield* Effect.gen(function*() {
-        const toolDescriptorsForSandbox = command.tools?.map((t) => ({
-          name: t.name,
-          parameterNames: t.parameterNames,
-          description: t.description
-        }))
+        const isStrict = sandboxConfig.sandboxMode === "strict"
+        const toolDescriptorsForSandbox = isStrict
+          ? undefined
+          : command.tools?.map((t) => ({
+              name: t.name,
+              parameterNames: t.parameterNames,
+              description: t.description
+            }))
 
         const sandbox = yield* sandboxFactory.create({
           callId: command.callId,
@@ -203,7 +206,10 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         description: t.description,
         parameterNames: t.parameterNames,
         parametersJsonSchema: t.parametersJsonSchema,
-        returnsJsonSchema: t.returnsJsonSchema
+        returnsJsonSchema: t.returnsJsonSchema,
+        ...(t.usageExamples !== undefined && t.usageExamples.length > 0
+          ? { usageExamples: t.usageExamples }
+          : {})
       }))
 
       const prompt = buildReplPrompt({
@@ -685,9 +691,12 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             }),
             Effect.retry(bridgeToolRetryPolicy),
             Effect.flatMap((result) => resolveBridgeDeferred(command.bridgeRequestId, result)),
-            Effect.catchAll((err) =>
-              failBridgeDeferred(command.bridgeRequestId, "message" in err ? err.message : String(err))
-            )
+            Effect.catchAllCause((cause) => {
+              const message = Cause.isFailType(cause)
+                ? ("message" in cause.error ? (cause.error as { message: string }).message : String(cause.error))
+                : Cause.pretty(cause)
+              return failBridgeDeferred(command.bridgeRequestId, message)
+            })
           ),
           callState.callScope
         )
@@ -705,9 +714,12 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             )
             yield* resolveBridgeDeferred(command.bridgeRequestId, oneShotResponseText)
           }).pipe(
-            Effect.catchAll((error) =>
-              failBridgeDeferred(command.bridgeRequestId, error)
-            )
+            Effect.catchAllCause((cause) => {
+              const message = Cause.isFailType(cause)
+                ? ("message" in cause.error ? (cause.error as { message: string }).message : String(cause.error))
+                : Cause.pretty(cause)
+              return failBridgeDeferred(command.bridgeRequestId, message)
+            })
           ),
           callState.callScope
         )
