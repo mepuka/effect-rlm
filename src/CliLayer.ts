@@ -7,6 +7,7 @@ import { Rlm, rlmBunLayer } from "./Rlm"
 import { RlmConfig, type RlmConfigService, type RlmProvider } from "./RlmConfig"
 import type { RlmModel } from "./RlmModel"
 import { makeAnthropicRlmModel, makeGoogleRlmModel, makeOpenAiRlmModel } from "./RlmModel"
+import { RunTraceConfig, type RunTraceConfigService } from "./RunTraceWriter"
 
 export interface CliArgs {
   query: string
@@ -24,6 +25,8 @@ export interface CliArgs {
   quiet: boolean
   noColor: boolean
   nlpTools: boolean
+  noTrace?: boolean
+  traceDir?: string
 }
 
 export const buildRlmModelLayer = (cliArgs: CliArgs): Layer.Layer<RlmModel, never, never> => {
@@ -110,9 +113,16 @@ export const makeCliConfig = (cliArgs: CliArgs): RlmConfigService => {
 export const buildCliLayer = (cliArgs: CliArgs): Layer.Layer<Rlm, never, never> => {
   const modelLayer = buildRlmModelLayer(cliArgs)
   const configLayer = Layer.succeed(RlmConfig, makeCliConfig(cliArgs))
+  const traceConfigLayer = Layer.succeed(RunTraceConfig, makeCliTraceConfig(cliArgs))
 
   return Layer.provide(
     rlmBunLayer,
-    Layer.mergeAll(modelLayer, configLayer)
+    Layer.mergeAll(modelLayer, configLayer, traceConfigLayer)
   )
 }
+
+export const makeCliTraceConfig = (cliArgs: CliArgs): RunTraceConfigService => ({
+  enabled: cliArgs.noTrace !== true,
+  baseDir: cliArgs.traceDir ?? ".rlm/traces",
+  maxSnapshotBytes: 5_000_000
+})

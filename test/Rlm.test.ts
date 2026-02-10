@@ -115,7 +115,7 @@ describe("Rlm thin slice", () => {
     }
   })
 
-  test("plain-output mode rejects SUBMIT value payloads", async () => {
+  test("plain-output mode recovers from invalid SUBMIT value payloads", async () => {
     const result = await Effect.runPromise(
       complete({
         query: "return bigint",
@@ -124,21 +124,23 @@ describe("Rlm thin slice", () => {
         Effect.either,
         Effect.provide(
           makeLayers({
-            responses: [{
-              toolCalls: [{
-                name: "SUBMIT",
-                params: { value: 10n }
-              }]
-            }]
+            responses: [
+              {
+                toolCalls: [{
+                  name: "SUBMIT",
+                  params: { value: 10n }
+                }]
+              },
+              submitAnswer("corrected answer")
+            ]
           })
         )
       )
     )
 
-    expect(result._tag).toBe("Left")
-    if (result._tag === "Left") {
-      expect(result.left).toBeInstanceOf(OutputValidationError)
-      expect(result.left.message).toContain("Plain-text output requires")
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("corrected answer")
     }
   })
 

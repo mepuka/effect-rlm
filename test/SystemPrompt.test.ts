@@ -358,6 +358,89 @@ describe("SystemPrompt", () => {
     })
     expect(prompt).toContain("(requires await)")
   })
+
+  test("canRecurse=false with tools includes tools but not llm_query", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      depth: 1,
+      maxDepth: 1,
+      tools: [makeTool("search")]
+    })
+    expect(prompt).toContain("## Available Tools")
+    expect(prompt).toContain("search")
+    expect(prompt).not.toContain("llm_query")
+  })
+
+  test("outputJsonSchema + corpus tools uses value-based SUBMIT in examples", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      depth: 0,
+      maxDepth: 1,
+      outputJsonSchema: { type: "object", properties: { ok: { type: "boolean" } } },
+      contextMetadata: {
+        format: "ndjson",
+        chars: 60_000,
+        lines: 500,
+        recordCount: 180
+      },
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus")
+      ]
+    })
+    expect(prompt).toContain("### Context-Specific Guidance")
+    expect(prompt).toContain("SUBMIT({ value:")
+    expect(prompt).toContain("Do NOT use `SUBMIT({ answer:")
+    // The retrieval-first example should use value-based SUBMIT, not answer-based
+    expect(prompt).toContain("SUBMIT({ value: synthesis })")
+  })
+
+  test("hasLargeStructuredContext + canRecurse=false omits context-specific guidance", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      depth: 1,
+      maxDepth: 1,
+      contextMetadata: {
+        format: "ndjson",
+        chars: 60_000,
+        lines: 500,
+        recordCount: 180
+      },
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus")
+      ]
+    })
+    expect(prompt).not.toContain("### Context-Specific Guidance")
+    expect(prompt).not.toContain("llm_query")
+  })
+
+  test("non-structured contextMetadata format omits context-specific guidance", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      depth: 0,
+      maxDepth: 1,
+      contextMetadata: {
+        format: "txt",
+        chars: 60_000,
+        lines: 500
+      },
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus")
+      ]
+    })
+    expect(prompt).not.toContain("### Context-Specific Guidance")
+  })
 })
 
 describe("buildExtractSystemPrompt", () => {

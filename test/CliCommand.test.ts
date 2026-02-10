@@ -112,6 +112,29 @@ describe("Effect CLI command", () => {
     expect(captured?.enablePromptCaching).toBe(false)
   })
 
+  test("maps --no-trace to noTrace=true", async () => {
+    const captured = await runWithCapture([
+      "bun",
+      "src/cli.ts",
+      "trace this run",
+      "--no-trace"
+    ])
+
+    expect(captured?.noTrace).toBe(true)
+  })
+
+  test("maps --trace-dir into CliArgs.traceDir", async () => {
+    const captured = await runWithCapture([
+      "bun",
+      "src/cli.ts",
+      "trace this run",
+      "--trace-dir",
+      "/tmp/rlm-traces"
+    ])
+
+    expect(captured?.traceDir).toBe("/tmp/rlm-traces")
+  })
+
   test("uses last delegation flag when both are present", async () => {
     const captured = await runWithCapture([
       "bun",

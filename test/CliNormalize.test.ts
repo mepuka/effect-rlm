@@ -23,7 +23,9 @@ const baseParsed: ParsedCliConfig = {
   noPromptCaching: false,
   quiet: false,
   noColor: false,
-  nlpTools: false
+  nlpTools: false,
+  noTrace: false,
+  traceDir: Option.none()
 }
 
 const fullEnv = {

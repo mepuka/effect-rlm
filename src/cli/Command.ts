@@ -80,6 +80,15 @@ const nlpTools = Options.boolean("nlp-tools").pipe(
   Options.withDescription("Enable built-in NLP tools (DocumentStats, ChunkBySentences, ExtractEntities, etc.)")
 )
 
+const noTrace = Options.boolean("no-trace").pipe(
+  Options.withDescription("Disable run trace persistence")
+)
+
+const traceDir = Options.text("trace-dir").pipe(
+  Options.optional,
+  Options.withDescription("Base directory for run traces")
+)
+
 const commandConfig = {
   query,
   context,
@@ -96,7 +105,9 @@ const commandConfig = {
   noPromptCaching,
   quiet,
   noColor,
-  nlpTools
+  nlpTools,
+  noTrace,
+  traceDir
 }
 
 export type CliExecutor = (cliArgs: CliArgs) => Effect.Effect<void>

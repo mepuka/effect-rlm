@@ -1,6 +1,7 @@
 import { Effect, PubSub } from "effect"
 import { RlmRuntime } from "../Runtime"
 import { RlmEvent, type CallId, type RlmCommand, type RlmEvent as RlmEventType } from "../RlmTypes"
+import { RunTraceWriter } from "../RunTraceWriter"
 
 export type SchedulerWarningCode =
   | "STALE_COMMAND_DROPPED"
@@ -10,6 +11,8 @@ export type SchedulerWarningCode =
   | "TOOLKIT_DEGRADED"
   | "VARIABLE_SYNC_FAILED"
   | "STALL_DETECTED_EARLY_EXTRACT"
+  | "SUBMIT_INVALID"
+  | "SUBMIT_RESOLVE_FAILED"
 
 export interface SchedulerWarning {
   readonly code: SchedulerWarningCode
@@ -20,12 +23,17 @@ export interface SchedulerWarning {
 
 export const publishEvent = Effect.fnUntraced(function*(event: RlmEventType) {
   const runtime = yield* RlmRuntime
+  const traceWriter = yield* RunTraceWriter
   yield* PubSub.publish(runtime.events, event)
+  yield* traceWriter.appendEvent(event).pipe(
+    Effect.catchAll((error) =>
+      Effect.logDebug(`Trace event write failed: ${String(error)}`))
+  )
 })
 
 export const publishSchedulerWarning = Effect.fnUntraced(function*(warning: SchedulerWarning) {
   const runtime = yield* RlmRuntime
-  yield* PubSub.publish(runtime.events, RlmEvent.SchedulerWarning({
+  yield* publishEvent(RlmEvent.SchedulerWarning({
     completionId: runtime.completionId,
     code: warning.code,
     message: warning.message,

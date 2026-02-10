@@ -122,7 +122,8 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     options.contextMetadata !== undefined &&
     STRUCTURED_CONTEXT_FORMATS.has(options.contextMetadata.format) &&
     (options.contextMetadata.recordCount ?? 0) > 50 &&
-    hasCorpusWorkflow
+    hasCorpusWorkflow &&
+    canRecurse
   const lines: Array<string> = []
 
   lines.push("You are a recursive problem-solving agent with access to a code sandbox.")
@@ -305,7 +306,11 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
       lines.push("print(synthesis)")
       lines.push("```")
       lines.push("")
-      lines.push("Then: `SUBMIT({ answer: synthesis })`")
+      if (options.outputJsonSchema) {
+        lines.push("Then: `SUBMIT({ value: synthesis })` or `SUBMIT({ variable: \"synthesis\" })`")
+      } else {
+        lines.push("Then: `SUBMIT({ answer: synthesis })`")
+      }
       lines.push("")
     } else {
       lines.push("## Example: Large-Context Semantic Analysis")
@@ -344,7 +349,11 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
       lines.push("print(synthesis)")
       lines.push("```")
       lines.push("")
-      lines.push("Then: `SUBMIT({ answer: synthesis })`")
+      if (options.outputJsonSchema) {
+        lines.push("Then: `SUBMIT({ value: synthesis })` or `SUBMIT({ variable: \"synthesis\" })`")
+      } else {
+        lines.push("Then: `SUBMIT({ answer: synthesis })`")
+      }
       lines.push("")
     }
   }
@@ -391,21 +400,23 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
       }
 
       if (hasCorpusTools) {
-      lines.push("**Corpus Retrieval (Stateful BM25)**")
-      pushNlpToolLine(lines, "CreateCorpus", "- `CreateCorpus(corpusId?, bm25Config?)` — create a named retrieval corpus.")
-      pushNlpToolLine(lines, "LearnCorpus", "- `LearnCorpus(corpusId, documents, dedupeById?)` — learn corpus docs incrementally (batch large datasets).")
-      pushNlpToolLine(lines, "QueryCorpus", "- `QueryCorpus(corpusId, query, topN?, includeText?)` — ranked retrieval against learned corpus.")
-      pushNlpToolLine(lines, "CorpusStats", "- `CorpusStats(corpusId, includeIdf?, includeMatrix?, topIdfTerms?)` — inspect term/IDF internals.")
-      pushNlpToolLine(lines, "DeleteCorpus", "- `DeleteCorpus(corpusId)` — release corpus memory when done.")
-      if (hasCorpusWorkflow) {
-        lines.push("- Retrieval-first pattern: create once -> learn in batches -> query repeatedly -> delete at end.")
-        lines.push("- Use corpus retrieval before expensive `llm_query_batched` passes over very large record sets.")
-        lines.push("- Helpers available in the sandbox:")
-        lines.push("  - `init_corpus(documents, options?)` — batch-learn an array of documents and set `__vars.contextCorpusId`.")
-        lines.push("  - `init_corpus_from_context(options?)` — parse `__vars.context` via `__vars.contextMeta`, learn corpus, and set `__vars.contextCorpusId`.")
+        lines.push("**Corpus Retrieval (Stateful BM25)**")
+        pushNlpToolLine(lines, "CreateCorpus", "- `CreateCorpus(corpusId?, bm25Config?)` — create a named retrieval corpus.")
+        pushNlpToolLine(lines, "LearnCorpus", "- `LearnCorpus(corpusId, documents, dedupeById?)` — learn corpus docs incrementally (batch large datasets).")
+        pushNlpToolLine(lines, "QueryCorpus", "- `QueryCorpus(corpusId, query, topN?, includeText?)` — ranked retrieval against learned corpus.")
+        pushNlpToolLine(lines, "CorpusStats", "- `CorpusStats(corpusId, includeIdf?, includeMatrix?, topIdfTerms?)` — inspect term/IDF internals.")
+        pushNlpToolLine(lines, "DeleteCorpus", "- `DeleteCorpus(corpusId)` — release corpus memory when done.")
+        if (hasCorpusWorkflow) {
+          lines.push("- Retrieval-first pattern: create once -> learn in batches -> query repeatedly -> delete at end.")
+          if (canRecurse) {
+            lines.push("- Use corpus retrieval before expensive `llm_query_batched` passes over very large record sets.")
+          }
+          lines.push("- Helpers available in the sandbox:")
+          lines.push("  - `init_corpus(documents, options?)` — batch-learn an array of documents and set `__vars.contextCorpusId`.")
+          lines.push("  - `init_corpus_from_context(options?)` — parse `__vars.context` via `__vars.contextMeta`, learn corpus, and set `__vars.contextCorpusId`.")
+        }
+        lines.push("")
       }
-      lines.push("")
-    }
 
       lines.push("- Prefer built-in NLP tools over custom heuristics when a tool already matches the task.")
     }
@@ -430,7 +441,6 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     lines.push("Respond with exactly one SUBMIT tool call using `value` or `variable`.")
     lines.push("If using `value`, the payload MUST be valid JSON matching this schema:")
     lines.push(JSON.stringify(options.outputJsonSchema, null, 2))
-    lines.push(`SUBMIT invocation schema for this run: ${JSON.stringify(submitInvocationSchema)}`)
     lines.push("")
   }
 

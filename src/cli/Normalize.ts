@@ -19,6 +19,8 @@ export interface ParsedCliConfig {
   readonly quiet: boolean
   readonly noColor: boolean
   readonly nlpTools: boolean
+  readonly noTrace: boolean
+  readonly traceDir: Option.Option<string>
 }
 
 type CliEnv = Record<string, string | undefined>
@@ -78,6 +80,7 @@ export const normalizeCliArgs = (
     const maxDepth = toUndefined(parsed.maxDepth)
     const maxLlmCalls = toUndefined(parsed.maxLlmCalls)
     const enablePromptCaching = parsed.noPromptCaching ? false : undefined
+    const traceDir = toUndefined(parsed.traceDir)
     const subDelegationEnabled = resolveSubDelegationEnabled(
       rawArgs,
       parsed.subDelegationEnabled,
@@ -102,6 +105,10 @@ export const normalizeCliArgs = (
       )
     }
 
+    if (traceDir !== undefined && traceDir.trim().length === 0) {
+      return yield* failCliInput("Error: --trace-dir must be a non-empty string")
+    }
+
     const cliArgs: CliArgs = {
       query: parsed.query,
       context: parsed.context,
@@ -110,6 +117,7 @@ export const normalizeCliArgs = (
       quiet: parsed.quiet,
       noColor: parsed.noColor,
       nlpTools: parsed.nlpTools,
+      ...(parsed.noTrace ? { noTrace: true } : {}),
       ...(contextFile !== undefined ? { contextFile } : {}),
       ...(subModel !== undefined ? { subModel } : {}),
       ...(subDelegationEnabled !== undefined ? { subDelegationEnabled } : {}),
@@ -117,6 +125,7 @@ export const normalizeCliArgs = (
       ...(maxIterations !== undefined ? { maxIterations } : {}),
       ...(maxDepth !== undefined ? { maxDepth } : {}),
       ...(maxLlmCalls !== undefined ? { maxLlmCalls } : {}),
+      ...(traceDir !== undefined ? { traceDir } : {}),
       ...(enablePromptCaching !== undefined ? { enablePromptCaching } : {})
     }
 

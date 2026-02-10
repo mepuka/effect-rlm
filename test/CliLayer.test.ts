@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { makeCliConfig, type CliArgs } from "../src/CliLayer"
+import { makeCliConfig, makeCliTraceConfig, type CliArgs } from "../src/CliLayer"
 
 const baseArgs: CliArgs = {
   query: "query",
@@ -87,5 +87,25 @@ describe("CliLayer config mapping", () => {
     })
 
     expect(config.enablePromptCaching).toBe(false)
+  })
+
+  test("enables tracing by default with default base directory", () => {
+    const traceConfig = makeCliTraceConfig({
+      ...baseArgs
+    })
+
+    expect(traceConfig.enabled).toBe(true)
+    expect(traceConfig.baseDir).toBe(".rlm/traces")
+  })
+
+  test("disables tracing with --no-trace and maps --trace-dir", () => {
+    const traceConfig = makeCliTraceConfig({
+      ...baseArgs,
+      noTrace: true,
+      traceDir: "/tmp/custom-traces"
+    })
+
+    expect(traceConfig.enabled).toBe(false)
+    expect(traceConfig.baseDir).toBe("/tmp/custom-traces")
   })
 })

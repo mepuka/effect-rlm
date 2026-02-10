@@ -15,6 +15,7 @@ import type { RlmToolAny } from "./RlmTool"
 import { BridgeStoreLive } from "./scheduler/BridgeStore"
 import { JSONSchema } from "effect"
 import type { ContextMetadata } from "./ContextMetadata"
+import { RunTraceConfig, RunTraceWriterBun, RunTraceWriterNoopLayer } from "./RunTraceWriter"
 
 export interface CompleteOptionsBase {
   readonly query: string
@@ -151,6 +152,7 @@ export const rlmBunLayer: Layer.Layer<Rlm, never, RlmModel> = Layer.effect(
     const rlmModel = yield* RlmModel
     const config = yield* RlmConfig
     const sandboxConfig = yield* SandboxConfig
+    const traceConfig = yield* RunTraceConfig
 
     // Shared dependencies (captured at layer-build time, not per-call)
     const sharedLayers = Layer.mergeAll(
@@ -162,10 +164,26 @@ export const rlmBunLayer: Layer.Layer<Rlm, never, RlmModel> = Layer.effect(
     // Per-call layer constructor: fresh RlmRuntime + BridgeStore → BridgeHandler → SandboxFactory
     const makePerCallDeps = () => {
       const runtimeStoreLayer = makeRuntimeStoreLayer()
+      const tracingLayer = traceConfig.enabled
+        ? Layer.provide(
+            RunTraceWriterBun({
+              baseDir: traceConfig.baseDir,
+              maxSnapshotBytes: traceConfig.maxSnapshotBytes
+            }),
+            runtimeStoreLayer
+          )
+        : RunTraceWriterNoopLayer
+
       const perCallLayer = Layer.fresh(
         Layer.provideMerge(
-          SandboxBunLive,
-          Layer.provideMerge(BridgeHandlerLive, runtimeStoreLayer)
+          Layer.mergeAll(
+            SandboxBunLive,
+            tracingLayer
+          ),
+          Layer.provideMerge(
+            BridgeHandlerLive,
+            runtimeStoreLayer
+          )
         )
       )
       return Layer.provideMerge(perCallLayer, sharedLayers)

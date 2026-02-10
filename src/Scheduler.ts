@@ -39,6 +39,7 @@ import {
 import { SandboxConfig, SandboxFactory } from "./Sandbox"
 import { RlmRuntime } from "./Runtime"
 import { BridgeRequestId, CallId, type FinalAnswerPayload, RlmCommand, RlmEvent } from "./RlmTypes"
+import { RunTraceWriter } from "./RunTraceWriter"
 import { makeCallVariableSpace } from "./VariableSpace"
 import { getCallStateOption, getCallStateOrWarn, deleteCallState, setCallState } from "./scheduler/CallStateStore"
 import { BridgeStore } from "./scheduler/BridgeStore"
@@ -78,6 +79,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
   const sandboxFactory = yield* SandboxFactory
   const sandboxConfig = yield* SandboxConfig
   const bridgeStore = yield* BridgeStore
+  const traceWriter = yield* RunTraceWriter
   const bridgeRetryBaseDelayMs = config.bridgeRetryBaseDelayMs ?? 50
   const bridgeToolRetryCount = config.bridgeToolRetryCount ?? 1
   const bridgeLlmQueryRetryCount = config.bridgeLlmQueryRetryCount ?? 1
@@ -239,6 +241,22 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           callId: command.callId,
           depth: command.depth
         }))
+
+        if (command.callId === rootCallId) {
+          yield* traceWriter.writeMeta({
+            completionId: runtime.completionId,
+            query: command.query,
+            contextChars: command.context.length,
+            ...(contextMetadata !== undefined ? { contextMetadata } : {}),
+            model: config.primaryTarget.model,
+            maxIterations: config.maxIterations,
+            maxLlmCalls: config.maxLlmCalls,
+            startedAt: new Date().toISOString()
+          }).pipe(
+            Effect.catchAll((error) =>
+              Effect.logDebug(`Trace meta write failed: ${String(error)}`))
+          )
+        }
 
         yield* enqueueOrWarn(RlmCommand.GenerateStep({
           callId: command.callId
@@ -417,12 +435,20 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           })
         }
         const resolvedSubmit = yield* resolveSubmitPayload(callState, submitAnswer.value, response.text).pipe(
-          Effect.catchAll((error) =>
+          Effect.catchAll((error: OutputValidationError) =>
             Effect.gen(function*() {
-              yield* enqueueOrWarn(RlmCommand.FailCall({
+              yield* publishSchedulerWarning({
+                code: "SUBMIT_RESOLVE_FAILED",
+                message: `SUBMIT variable resolution failed: ${error.message}; feeding error back to model for self-correction.`,
                 callId: command.callId,
-                error
-              }))
+                commandTag: command._tag
+              })
+              yield* appendTranscript(callState, response.text)
+              yield* attachExecutionOutput(callState,
+                `\u2717 SUBMIT failed: ${error.message}\nFix your __vars assignment and try SUBMIT again.`
+              )
+              yield* incrementIteration(callState)
+              yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: callState.callId }))
               return undefined
             })
           )
@@ -437,13 +463,18 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       }
 
       if (submitAnswer._tag === "Invalid") {
-        yield* enqueueOrWarn(RlmCommand.FailCall({
+        yield* publishSchedulerWarning({
+          code: "SUBMIT_INVALID",
+          message: `Invalid SUBMIT parameters: ${submitAnswer.message}; feeding error back to model for self-correction.`,
           callId: command.callId,
-          error: new OutputValidationError({
-            message: submitAnswer.message,
-            raw: response.text
-          })
-        }))
+          commandTag: command._tag
+        })
+        yield* appendTranscript(callState, response.text)
+        yield* attachExecutionOutput(callState,
+          `\u2717 SUBMIT failed: ${submitAnswer.message}\nCheck the SUBMIT invocation schema and try again.`
+        )
+        yield* incrementIteration(callState)
+        yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: callState.callId }))
         return
       }
 
@@ -706,6 +737,38 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         )
       )
 
+      yield* Effect.fork(
+        Effect.gen(function*() {
+          const snapshot = yield* vars.cached
+          const iteration = yield* readIteration(callState)
+          const fullVars: Record<string, unknown> = {}
+
+          for (const variable of snapshot.variables) {
+            if (
+              variable.name === "context" ||
+              variable.name === "contextMeta" ||
+              variable.name === "query"
+            ) {
+              continue
+            }
+            fullVars[variable.name] = yield* vars.read(variable.name).pipe(
+              Effect.catchAll((error) =>
+                Effect.succeed(`(read failed: ${formatExecutionError(error)})`))
+            )
+          }
+
+          yield* traceWriter.writeVarSnapshot({
+            callId: callState.callId,
+            depth: callState.depth,
+            iteration,
+            vars: fullVars
+          })
+        }).pipe(
+          Effect.catchAll((error) =>
+            Effect.logDebug(`Trace variable snapshot write failed: ${String(error)}`))
+        )
+      )
+
       yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: command.callId }))
     })
 
@@ -925,6 +988,13 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         depth: callState.depth,
         answer: renderedAnswer
       }))
+
+      if (command.callId === rootCallId) {
+        yield* traceWriter.writeResult(command.payload).pipe(
+          Effect.catchAll((error) =>
+            Effect.logDebug(`Trace final result write failed: ${String(error)}`))
+        )
+      }
 
       yield* Scope.close(callState.callScope, Exit.void)
       yield* deleteCallState(command.callId)
