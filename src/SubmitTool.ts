@@ -23,20 +23,6 @@ const SubmitVariableField = Schema.String.pipe(Schema.minLength(1)).annotations(
   examples: ["finalAnswer", "finalValue"]
 })
 
-const SubmitToolParameters = {
-  answer: Schema.optional(SubmitAnswerField),
-  value: Schema.optional(SubmitValueField),
-  variable: Schema.optional(SubmitVariableField)
-}
-
-const SubmitToolDefinition = Tool.make(SUBMIT_TOOL_NAME, {
-  description: SUBMIT_TOOL_DESCRIPTION,
-  parameters: {
-    ...SubmitToolParameters
-  },
-  success: Schema.Void
-})
-
 export const buildSubmitInvocationSchema = (outputJsonSchema?: object): object =>
   outputJsonSchema !== undefined
     ? {
@@ -85,19 +71,32 @@ export const buildSubmitInvocationSchema = (outputJsonSchema?: object): object =
         }]
       }
 
-const SubmitToolkit = Toolkit.make(SubmitToolDefinition)
+// --- Mode-specific SUBMIT toolkits ---
+// Only expose fields relevant to the output mode so providers can't use wrong fields.
 
-const SubmitHandlers = SubmitToolkit.of({
-  SUBMIT: () => Effect.void
+const makeSubmitToolkit = (parameters: Schema.Struct.Fields) => {
+  const tool = Tool.make(SUBMIT_TOOL_NAME, {
+    description: SUBMIT_TOOL_DESCRIPTION,
+    parameters,
+    success: Schema.Void
+  })
+  const tk = Toolkit.make(tool)
+  const handlers = tk.of({ SUBMIT: () => Effect.void })
+  return tk.pipe(Effect.provide(tk.toLayer(handlers)))
+}
+
+const submitToolkitPlain = makeSubmitToolkit({
+  answer: Schema.optional(SubmitAnswerField),
+  variable: Schema.optional(SubmitVariableField)
 })
 
-export const submitToolkit: Effect.Effect<
-  Toolkit.WithHandler<{
-    readonly SUBMIT: typeof SubmitToolDefinition
-  }>
-> = SubmitToolkit.pipe(
-  Effect.provide(SubmitToolkit.toLayer(SubmitHandlers))
-)
+const submitToolkitStructured = makeSubmitToolkit({
+  value: Schema.optional(SubmitValueField),
+  variable: Schema.optional(SubmitVariableField)
+})
+
+export const buildSubmitToolkit = (outputMode: "plain" | "structured") =>
+  outputMode === "structured" ? submitToolkitStructured : submitToolkitPlain
 
 const SubmitPlainPayload = Schema.Struct({
   answer: SubmitAnswerField

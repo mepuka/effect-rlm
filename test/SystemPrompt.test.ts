@@ -427,7 +427,7 @@ describe("SystemPrompt", () => {
       depth: 0,
       maxDepth: 1,
       contextMetadata: {
-        format: "txt",
+        format: "plain-text",
         chars: 60_000,
         lines: 500
       },

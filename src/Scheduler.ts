@@ -30,10 +30,10 @@ import {
 } from "./RlmPrompt"
 import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildExtractSystemPrompt } from "./SystemPrompt"
 import {
+  buildSubmitToolkit,
   extractSubmitAnswer,
   renderSubmitAnswer,
   SUBMIT_TOOL_NAME,
-  submitToolkit,
   type SubmitPayload
 } from "./SubmitTool"
 import { SandboxConfig, SandboxFactory } from "./Sandbox"
@@ -358,12 +358,14 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         enablePromptCaching: config.enablePromptCaching
       })
       const isSubCall = callState.parentBridgeRequestId !== undefined
+      const outputMode = callState.outputJsonSchema !== undefined ? "structured" as const : "plain" as const
+      const toolkit = buildSubmitToolkit(outputMode)
       const response = yield* withLlmPermit(
         rlmModel.generateText({
           prompt,
           depth: callState.depth,
           isSubCall,
-          toolkit: submitToolkit,
+          toolkit,
           toolChoice: "auto",
           disableToolCallResolution: true
         })
@@ -445,7 +447,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
               })
               yield* appendTranscript(callState, response.text)
               yield* attachExecutionOutput(callState,
-                `\u2717 SUBMIT failed: ${error.message}\nFix your __vars assignment and try SUBMIT again.`
+                `\u2717 SUBMIT rejected: ${error.message}\nFix your __vars assignment with code first, then call SUBMIT. Do NOT retry SUBMIT immediately — write a \`\`\`js code block to fix the issue.`
               )
               yield* incrementIteration(callState)
               yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: callState.callId }))
@@ -471,7 +473,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         })
         yield* appendTranscript(callState, response.text)
         yield* attachExecutionOutput(callState,
-          `\u2717 SUBMIT failed: ${submitAnswer.message}\nCheck the SUBMIT invocation schema and try again.`
+          `\u2717 SUBMIT rejected: ${submitAnswer.message}\nYou have not completed the task yet. Continue working by writing a \`\`\`js code block. Only call SUBMIT after you have finished and verified your results.`
         )
         yield* incrementIteration(callState)
         yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: callState.callId }))
@@ -558,12 +560,14 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             enablePromptCaching: config.enablePromptCaching
           })
 
+          const extractOutputMode = callState.outputJsonSchema !== undefined ? "structured" as const : "plain" as const
+          const extractToolkit = buildSubmitToolkit(extractOutputMode)
           const response = yield* withLlmPermit(
             rlmModel.generateText({
               prompt: extractPrompt,
               depth: callState.depth,
               isSubCall: callState.parentBridgeRequestId !== undefined,
-              toolkit: submitToolkit,
+              toolkit: extractToolkit,
               toolChoice: { tool: SUBMIT_TOOL_NAME },
               disableToolCallResolution: true
             })
