@@ -2,16 +2,25 @@ import { Context, Deferred, Effect, Layer, Option, PubSub, Queue, Ref } from "ef
 import type { CallContext } from "./CallContext"
 import { RlmConfig } from "./RlmConfig"
 import type { SandboxError } from "./RlmError"
-import { BudgetState, type BridgeRequestId, type CallId, type RlmCommand, type RlmEvent } from "./RlmTypes"
+import {
+  BudgetState,
+  type BridgeRequestId,
+  type CallId,
+  type PartialResult,
+  type RlmCommand,
+  type RlmEvent
+} from "./RlmTypes"
 
 export interface RlmRuntimeShape {
   readonly completionId: string
+  readonly completionStartedAtMs: number
   readonly commands: Queue.Queue<RlmCommand>
   readonly events: PubSub.PubSub<RlmEvent>
   readonly budgetRef: Ref.Ref<BudgetState>
   readonly llmSemaphore: Effect.Semaphore
   readonly callStates: Ref.Ref<Map<CallId, CallContext>>
   readonly bridgePending: Ref.Ref<Map<BridgeRequestId, Deferred.Deferred<unknown, SandboxError>>>
+  readonly partialOutcomesRef: Ref.Ref<Map<CallId, PartialResult>>
 }
 
 export class RlmRuntime extends Context.Tag("@recursive-llm/RlmRuntime")<
@@ -37,23 +46,27 @@ export const RlmRuntimeLive = Layer.scoped(
     const budgetRef = yield* Ref.make(new BudgetState({
       iterationsRemaining: config.maxIterations,
       llmCallsRemaining: config.maxLlmCalls,
-      tokenBudgetRemaining: Option.fromNullable(config.maxTotalTokens)
+      tokenBudgetRemaining: Option.fromNullable(config.maxTotalTokens),
+      totalTokensUsed: 0
     }))
 
     const llmSemaphore = yield* Effect.makeSemaphore(config.concurrency)
     const callStates = yield* Ref.make(new Map<CallId, CallContext>())
     const bridgePending = yield* Ref.make(new Map<BridgeRequestId, Deferred.Deferred<unknown, SandboxError>>())
+    const partialOutcomesRef = yield* Ref.make(new Map<CallId, PartialResult>())
 
     const completionId = `completion-${crypto.randomUUID()}`
 
     return {
       completionId,
+      completionStartedAtMs: Date.now(),
       commands,
       events,
       budgetRef,
       llmSemaphore,
       callStates,
-      bridgePending
+      bridgePending,
+      partialOutcomesRef
     } satisfies RlmRuntimeShape
   })
 )

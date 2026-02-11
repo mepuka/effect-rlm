@@ -5,7 +5,31 @@ import { Rlm } from "../Rlm"
 import { formatEvent, type RenderOptions } from "../RlmRenderer"
 import type { RlmToolAny } from "../RlmTool"
 import { analyzeContext } from "../ContextMetadata"
+import type { MediaAttachment } from "../RlmTypes"
 import * as path from "node:path"
+
+const detectMediaType = (filePath: string): string => {
+  const extension = path.extname(filePath).toLowerCase()
+  switch (extension) {
+    case ".png":
+      return "image/png"
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg"
+    case ".webp":
+      return "image/webp"
+    case ".gif":
+      return "image/gif"
+    case ".pdf":
+      return "application/pdf"
+    case ".mp3":
+      return "audio/mpeg"
+    case ".wav":
+      return "audio/wav"
+    default:
+      return "application/octet-stream"
+  }
+}
 
 export const runCliProgram = (cliArgs: CliArgs) =>
   Effect.gen(function*() {
@@ -20,6 +44,29 @@ export const runCliProgram = (cliArgs: CliArgs) =>
     const tools: ReadonlyArray<RlmToolAny> = cliArgs.nlpTools
       ? yield* nlpTools.pipe(Effect.orDie)
       : []
+    const attachmentMap = new Map<string, MediaAttachment>()
+
+    if (cliArgs.media !== undefined) {
+      for (const entry of cliArgs.media) {
+        const file = Bun.file(entry.path)
+        const data = new Uint8Array(yield* Effect.promise(() => file.arrayBuffer()))
+        attachmentMap.set(entry.name, {
+          name: entry.name,
+          mediaType: file.type || detectMediaType(entry.path),
+          data
+        })
+      }
+    }
+    if (cliArgs.mediaUrls !== undefined) {
+      for (const entry of cliArgs.mediaUrls) {
+        attachmentMap.set(entry.name, {
+          name: entry.name,
+          mediaType: detectMediaType(entry.url),
+          data: new URL(entry.url)
+        })
+      }
+    }
+    const mediaAttachments = [...attachmentMap.values()]
 
     const rlm = yield* Rlm
 
@@ -32,6 +79,7 @@ export const runCliProgram = (cliArgs: CliArgs) =>
       query: cliArgs.query,
       context,
       ...(contextMetadata !== undefined ? { contextMetadata } : {}),
+      ...(mediaAttachments.length > 0 ? { mediaAttachments } : {}),
       tools
     }).pipe(
       Stream.runFoldEffect(

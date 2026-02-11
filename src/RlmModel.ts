@@ -7,6 +7,7 @@ import type { GoogleClient } from "@effect/ai-google/GoogleClient"
 import * as OpenAiLanguageModel from "@effect/ai-openai/OpenAiLanguageModel"
 import type { OpenAiClient } from "@effect/ai-openai/OpenAiClient"
 import { Context, Effect, Layer } from "effect"
+import type { RlmModelTarget } from "./RlmConfig"
 import type { RlmError } from "./RlmError"
 import { UnknownRlmError } from "./RlmError"
 
@@ -17,6 +18,8 @@ export interface RlmModelService {
     readonly prompt: Prompt.Prompt
     readonly depth: number
     readonly isSubCall?: boolean
+    readonly namedModel?: string
+    readonly routeSource?: "named" | "sub" | "primary"
     readonly toolkit?: LanguageModel.GenerateTextOptions<any>["toolkit"]
     readonly toolChoice?: LanguageModel.GenerateTextOptions<any>["toolChoice"]
     readonly disableToolCallResolution?: boolean
@@ -36,29 +39,50 @@ export interface SubLlmDelegationOptions {
 
 // --- Layer constructor ---
 
-export const makeRlmModelLayer = <RPrimary, RSub = never>(options: {
+export const makeRlmModelLayer = <RPrimary, RSub = never, RNamed = never>(options: {
   readonly primary: Effect.Effect<LanguageModel.Service, never, RPrimary>
   readonly sub?: Effect.Effect<LanguageModel.Service, never, RSub>
+  readonly named?: Record<string, Effect.Effect<LanguageModel.Service, never, RNamed>>
   readonly subLlmDelegation?: SubLlmDelegationOptions
-}): Layer.Layer<RlmModel, never, RPrimary | RSub> =>
+}): Layer.Layer<RlmModel, never, RPrimary | RSub | RNamed> =>
   Layer.effect(RlmModel, Effect.gen(function*() {
     const primaryLm = yield* options.primary
     const hasSubModel = options.sub !== undefined
     const subLm = hasSubModel ? yield* options.sub! : primaryLm
+    const namedEntries = options.named !== undefined
+      ? Object.entries(options.named)
+      : []
+    const namedModels = new Map<string, LanguageModel.Service>()
+
+    for (const [name, modelEffect] of namedEntries) {
+      namedModels.set(name, yield* modelEffect)
+    }
+
     const subLlmDelegation: SubLlmDelegationOptions = options.subLlmDelegation ?? {
       enabled: hasSubModel,
       depthThreshold: 1
     }
 
     return RlmModel.of({
-      generateText: ({ prompt, depth, isSubCall, toolkit, toolChoice, disableToolCallResolution, concurrency }) => {
-        const useSubModel =
-          hasSubModel &&
-          subLlmDelegation.enabled &&
-          isSubCall === true &&
-          depth >= subLlmDelegation.depthThreshold
+      generateText: ({ prompt, depth, isSubCall, namedModel, toolkit, toolChoice, disableToolCallResolution, concurrency }) => {
+        let lm: LanguageModel.Service
+        if (namedModel !== undefined) {
+          const named = namedModels.get(namedModel)
+          if (named === undefined) {
+            return new UnknownRlmError({
+              message: `Unknown named model "${namedModel}". Available: ${[...namedModels.keys()].join(", ") || "(none)"}`
+            })
+          }
+          lm = named
+        } else {
+          const useSubModel =
+            hasSubModel &&
+            subLlmDelegation.enabled &&
+            isSubCall === true &&
+            depth >= subLlmDelegation.depthThreshold
 
-        const lm = useSubModel ? subLm : primaryLm
+          lm = useSubModel ? subLm : primaryLm
+        }
 
         return lm.generateText({
           prompt,
@@ -84,6 +108,7 @@ export const makeAnthropicRlmModel = (options: {
   readonly primaryConfig?: Omit<AnthropicLanguageModel.Config.Service, "model">
   readonly subModel?: string
   readonly subConfig?: Omit<AnthropicLanguageModel.Config.Service, "model">
+  readonly namedModels?: Record<string, RlmModelTarget>
   readonly subLlmDelegation?: SubLlmDelegationOptions
 }): Layer.Layer<RlmModel, never, AnthropicClient> =>
   makeRlmModelLayer({
@@ -103,6 +128,20 @@ export const makeAnthropicRlmModel = (options: {
           })
         }
       : {}),
+    ...(options.namedModels !== undefined
+      ? {
+          named: Object.fromEntries(
+            Object.entries(options.namedModels)
+              .filter(([, target]) => target.provider === "anthropic")
+              .map(([name, target]) => [
+                name,
+                AnthropicLanguageModel.make({
+                  model: target.model
+                })
+              ])
+          )
+        }
+      : {}),
     ...(options.subLlmDelegation !== undefined
       ? { subLlmDelegation: options.subLlmDelegation }
       : {})
@@ -113,6 +152,7 @@ export const makeGoogleRlmModel = (options: {
   readonly primaryConfig?: Omit<GoogleLanguageModel.Config.Service, "model">
   readonly subModel?: string
   readonly subConfig?: Omit<GoogleLanguageModel.Config.Service, "model">
+  readonly namedModels?: Record<string, RlmModelTarget>
   readonly subLlmDelegation?: SubLlmDelegationOptions
 }): Layer.Layer<RlmModel, never, GoogleClient> =>
   makeRlmModelLayer({
@@ -132,6 +172,20 @@ export const makeGoogleRlmModel = (options: {
           })
         }
       : {}),
+    ...(options.namedModels !== undefined
+      ? {
+          named: Object.fromEntries(
+            Object.entries(options.namedModels)
+              .filter(([, target]) => target.provider === "google")
+              .map(([name, target]) => [
+                name,
+                GoogleLanguageModel.make({
+                  model: target.model
+                })
+              ])
+          )
+        }
+      : {}),
     ...(options.subLlmDelegation !== undefined
       ? { subLlmDelegation: options.subLlmDelegation }
       : {})
@@ -142,6 +196,7 @@ export const makeOpenAiRlmModel = (options: {
   readonly primaryConfig?: Omit<OpenAiLanguageModel.Config.Service, "model">
   readonly subModel?: string
   readonly subConfig?: Omit<OpenAiLanguageModel.Config.Service, "model">
+  readonly namedModels?: Record<string, RlmModelTarget>
   readonly subLlmDelegation?: SubLlmDelegationOptions
 }): Layer.Layer<RlmModel, never, OpenAiClient> =>
   makeRlmModelLayer({
@@ -159,6 +214,20 @@ export const makeOpenAiRlmModel = (options: {
               ? { config: (options.subConfig ?? options.primaryConfig)! }
               : {})
           })
+        }
+      : {}),
+    ...(options.namedModels !== undefined
+      ? {
+          named: Object.fromEntries(
+            Object.entries(options.namedModels)
+              .filter(([, target]) => target.provider === "openai")
+              .map(([name, target]) => [
+                name,
+                OpenAiLanguageModel.make({
+                  model: target.model
+                })
+              ])
+          )
         }
       : {}),
     ...(options.subLlmDelegation !== undefined

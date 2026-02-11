@@ -1,12 +1,17 @@
+import * as LanguageModel from "@effect/ai/LanguageModel"
+import * as AnthropicLanguageModel from "@effect/ai-anthropic/AnthropicLanguageModel"
 import { AnthropicClient } from "@effect/ai-anthropic"
+import * as GoogleLanguageModel from "@effect/ai-google/GoogleLanguageModel"
 import { GoogleClient } from "@effect/ai-google"
+import * as OpenAiLanguageModel from "@effect/ai-openai/OpenAiLanguageModel"
 import { OpenAiClient } from "@effect/ai-openai"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "@effect/platform"
-import { Layer, Redacted } from "effect"
+import { Effect, Layer, Redacted } from "effect"
 import { Rlm, rlmBunLayer } from "./Rlm"
-import { RlmConfig, type RlmConfigService, type RlmProvider } from "./RlmConfig"
+import { RlmConfig, type RlmConfigService, type RlmProvider, type RlmModelTarget } from "./RlmConfig"
 import type { RlmModel } from "./RlmModel"
-import { makeAnthropicRlmModel, makeGoogleRlmModel, makeOpenAiRlmModel } from "./RlmModel"
+import { makeRlmModelLayer } from "./RlmModel"
+import { SandboxConfig } from "./Sandbox"
 import { RunTraceConfig, type RunTraceConfigService } from "./RunTraceWriter"
 
 export interface CliArgs {
@@ -16,17 +21,41 @@ export interface CliArgs {
   provider: RlmProvider
   model: string
   subModel?: string
+  namedModels?: Record<string, RlmModelTarget>
   subDelegationEnabled?: boolean
   subDelegationDepthThreshold?: number
   maxIterations?: number
   maxDepth?: number
   maxLlmCalls?: number
+  maxTotalTokens?: number
+  maxTimeMs?: number
+  sandboxTransport?: "auto" | "worker" | "spawn"
+  media?: ReadonlyArray<{ readonly name: string; readonly path: string }>
+  mediaUrls?: ReadonlyArray<{ readonly name: string; readonly url: string }>
   enablePromptCaching?: boolean
   quiet: boolean
   noColor: boolean
   nlpTools: boolean
   noTrace?: boolean
   traceDir?: string
+}
+
+const targetToEffect = (
+  target: RlmModelTarget
+): Effect.Effect<LanguageModel.Service, never, any> => {
+  if (target.provider === "openai") {
+    return OpenAiLanguageModel.make({
+      model: target.model
+    }) as Effect.Effect<LanguageModel.Service, never, any>
+  }
+  if (target.provider === "google") {
+    return GoogleLanguageModel.make({
+      model: target.model
+    }) as Effect.Effect<LanguageModel.Service, never, any>
+  }
+  return AnthropicLanguageModel.make({
+    model: target.model
+  }) as Effect.Effect<LanguageModel.Service, never, any>
 }
 
 export const buildRlmModelLayer = (cliArgs: CliArgs): Layer.Layer<RlmModel, never, never> => {
@@ -36,60 +65,88 @@ export const buildRlmModelLayer = (cliArgs: CliArgs): Layer.Layer<RlmModel, neve
     depthThreshold: cliArgs.subDelegationDepthThreshold ?? 1
   }
 
-  if (cliArgs.provider === "openai") {
-    const clientLayer = OpenAiClient.layer({
-      apiKey: Redacted.make(Bun.env.OPENAI_API_KEY!)
-    })
-
-    const modelLayer = makeOpenAiRlmModel({
-      primaryModel: cliArgs.model,
-      ...(cliArgs.subModel !== undefined ? { subModel: cliArgs.subModel } : {}),
-      subLlmDelegation
-    })
-
-    return Layer.provide(modelLayer, Layer.provide(clientLayer, httpLayer))
+  const primaryTarget: RlmModelTarget = {
+    provider: cliArgs.provider,
+    model: cliArgs.model
   }
+  const subTarget = cliArgs.subModel !== undefined
+    ? {
+        provider: cliArgs.provider,
+        model: cliArgs.subModel
+      } satisfies RlmModelTarget
+    : undefined
+  const named = cliArgs.namedModels
+  const namedEffects = named !== undefined
+    ? Object.fromEntries(
+        Object.entries(named).map(([name, target]) => [name, targetToEffect(target)])
+      )
+    : undefined
 
-  if (cliArgs.provider === "google") {
-    const useVertexAi = Bun.env.GOOGLE_API_URL !== undefined
-    const clientLayer = GoogleClient.layer({
-      apiKey: Redacted.make(Bun.env.GOOGLE_API_KEY!),
-      ...(useVertexAi ? {
-        apiUrl: Bun.env.GOOGLE_API_URL,
-        // Vertex AI uses /v1/publishers/google/models/{model}:method
-        // Effect AI generates /v1beta/models/{model}:method — rewrite the path
-        transformClient: (client: HttpClient.HttpClient) =>
-          HttpClient.mapRequest(client, (req) => {
-            const url = new URL(req.url)
-            url.pathname = url.pathname.replace(
-              /\/v1beta\/models\//,
-              "/v1/publishers/google/models/"
-            )
-            return HttpClientRequest.setUrl(req, url.toString())
-          })
-      } : {})
-    })
-
-    const modelLayer = makeGoogleRlmModel({
-      primaryModel: cliArgs.model,
-      ...(cliArgs.subModel !== undefined ? { subModel: cliArgs.subModel } : {}),
-      subLlmDelegation
-    })
-
-    return Layer.provide(modelLayer, Layer.provide(clientLayer, httpLayer))
-  }
-
-  const clientLayer = AnthropicClient.layer({
-    apiKey: Redacted.make(Bun.env.ANTHROPIC_API_KEY!)
-  })
-
-  const modelLayer = makeAnthropicRlmModel({
-    primaryModel: cliArgs.model,
-    ...(cliArgs.subModel !== undefined ? { subModel: cliArgs.subModel } : {}),
+  const modelLayer = makeRlmModelLayer({
+    primary: targetToEffect(primaryTarget),
+    ...(subTarget !== undefined ? { sub: targetToEffect(subTarget) } : {}),
+    ...(namedEffects !== undefined ? { named: namedEffects } : {}),
     subLlmDelegation
   })
 
-  return Layer.provide(modelLayer, Layer.provide(clientLayer, httpLayer))
+  const providers = new Set<RlmProvider>([
+    primaryTarget.provider,
+    ...(subTarget !== undefined ? [subTarget.provider] : []),
+    ...(named !== undefined ? Object.values(named).map((target) => target.provider) : [])
+  ])
+
+  const clientLayers: Array<Layer.Layer<any, never, never>> = []
+  if (providers.has("anthropic")) {
+    clientLayers.push(
+      Layer.provide(
+        AnthropicClient.layer({
+          apiKey: Redacted.make(Bun.env.ANTHROPIC_API_KEY!)
+        }),
+        httpLayer
+      )
+    )
+  }
+  if (providers.has("openai")) {
+    clientLayers.push(
+      Layer.provide(
+        OpenAiClient.layer({
+          apiKey: Redacted.make(Bun.env.OPENAI_API_KEY!)
+        }),
+        httpLayer
+      )
+    )
+  }
+  if (providers.has("google")) {
+    const useVertexAi = Bun.env.GOOGLE_API_URL !== undefined
+    clientLayers.push(
+      Layer.provide(
+        GoogleClient.layer({
+          apiKey: Redacted.make(Bun.env.GOOGLE_API_KEY!),
+          ...(useVertexAi ? {
+            apiUrl: Bun.env.GOOGLE_API_URL,
+            transformClient: (client: HttpClient.HttpClient) =>
+              HttpClient.mapRequest(client, (req) => {
+                const url = new URL(req.url)
+                url.pathname = url.pathname.replace(
+                  /\/v1beta\/models\//,
+                  "/v1/publishers/google/models/"
+                )
+                return HttpClientRequest.setUrl(req, url.toString())
+              })
+          } : {})
+        }),
+        httpLayer
+      )
+    )
+  }
+
+  const head = clientLayers[0]!
+  const clientsLayer = clientLayers.slice(1).reduce(
+    (acc, layer) => Layer.merge(acc, layer),
+    head
+  )
+
+  return Layer.provide(modelLayer, clientsLayer) as Layer.Layer<RlmModel, never, never>
 }
 
 export const makeCliConfig = (cliArgs: CliArgs): RlmConfigService => {
@@ -102,7 +159,8 @@ export const makeCliConfig = (cliArgs: CliArgs): RlmConfigService => {
     maxIterations: cliArgs.maxIterations ?? 50,
     maxDepth: cliArgs.maxDepth ?? 1,
     maxLlmCalls: cliArgs.maxLlmCalls ?? 200,
-    maxTotalTokens: null,
+    maxTotalTokens: cliArgs.maxTotalTokens ?? null,
+    ...(cliArgs.maxTimeMs !== undefined ? { maxTimeMs: cliArgs.maxTimeMs } : {}),
     commandQueueCapacity: 8_192,
     concurrency: 4,
     enableLlmQueryBatched: true,
@@ -122,6 +180,7 @@ export const makeCliConfig = (cliArgs: CliArgs): RlmConfigService => {
           }
         }
       : {}),
+    ...(cliArgs.namedModels !== undefined ? { namedModels: cliArgs.namedModels } : {}),
     subLlmDelegation
   }
 }
@@ -129,11 +188,24 @@ export const makeCliConfig = (cliArgs: CliArgs): RlmConfigService => {
 export const buildCliLayer = (cliArgs: CliArgs): Layer.Layer<Rlm, never, never> => {
   const modelLayer = buildRlmModelLayer(cliArgs)
   const configLayer = Layer.succeed(RlmConfig, makeCliConfig(cliArgs))
+  const sandboxConfigLayer = Layer.succeed(SandboxConfig, {
+    sandboxMode: "permissive" as const,
+    sandboxTransport: cliArgs.sandboxTransport ?? "auto",
+    executeTimeoutMs: 300_000,
+    setVarTimeoutMs: 5_000,
+    getVarTimeoutMs: 5_000,
+    listVarTimeoutMs: 5_000,
+    shutdownGraceMs: 2_000,
+    maxFrameBytes: 32 * 1024 * 1024,
+    maxBridgeConcurrency: 4,
+    incomingFrameQueueCapacity: 2_048,
+    workerPath: new URL("./sandbox-worker.ts", import.meta.url).pathname
+  })
   const traceConfigLayer = Layer.succeed(RunTraceConfig, makeCliTraceConfig(cliArgs))
 
   return Layer.provide(
     rlmBunLayer,
-    Layer.mergeAll(modelLayer, configLayer, traceConfigLayer)
+    Layer.mergeAll(modelLayer, configLayer, sandboxConfigLayer, traceConfigLayer)
   )
 }
 

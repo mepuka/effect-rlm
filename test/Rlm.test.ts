@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { Chunk, Effect, Layer, Schema, Stream } from "effect"
-import { complete, stream } from "../src/Rlm"
+import { complete, completeWithOutcome, stream } from "../src/Rlm"
 import { RlmConfig, type RlmConfigService } from "../src/RlmConfig"
 import { BudgetExhaustedError, OutputValidationError } from "../src/RlmError"
 import { RlmRuntimeLive } from "../src/Runtime"
@@ -212,6 +212,31 @@ describe("Rlm thin slice", () => {
     const second = await runOnce()
 
     expect(first).toEqual(second)
+  })
+
+  test("completeWithOutcome returns Partial when extraction cannot finalize", async () => {
+    const outcome = await Effect.runPromise(
+      completeWithOutcome({
+        query: "No finalize",
+        context: "ctx"
+      }).pipe(
+        Effect.provide(
+          makeLayers({
+            responses: [
+              { text: "thinking..." },
+              { text: "still no submit" }
+            ],
+            config: { maxIterations: 1 }
+          })
+        )
+      )
+    )
+
+    expect(outcome._tag).toBe("Partial")
+    if (outcome._tag === "Partial") {
+      expect(outcome.payload.reason).toBe("iterations")
+      expect(outcome.payload.transcript.length).toBeGreaterThan(0)
+    }
   })
 })
 

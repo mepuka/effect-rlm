@@ -1,4 +1,4 @@
-import { Cause, Deferred, Duration, Effect, Exit, Match, Option, Queue, Ref, Schedule, Scope, Stream } from "effect"
+import { Cause, Clock, Deferred, Duration, Effect, Exit, Match, Option, Queue, Ref, Schedule, Scope, Stream } from "effect"
 import { consumeIteration, recordTokens, reserveLlmCall, snapshot, withLlmPermit } from "./Budget"
 import {
   appendTranscript,
@@ -27,6 +27,7 @@ import {
 import {
   buildReplPrompt,
   buildOneShotPrompt,
+  buildOneShotPromptWithMedia,
   buildExtractPrompt,
   truncateExecutionOutput
 } from "./RlmPrompt"
@@ -40,7 +41,16 @@ import {
 } from "./SubmitTool"
 import { SandboxConfig, SandboxFactory } from "./Sandbox"
 import { RlmRuntime } from "./Runtime"
-import { BridgeRequestId, CallId, type FinalAnswerPayload, RlmCommand, RlmEvent } from "./RlmTypes"
+import {
+  BridgeRequestId,
+  CallId,
+  type CompletionOutcome,
+  type FinalAnswerPayload,
+  type MediaAttachment,
+  type PartialResult,
+  RlmCommand,
+  RlmEvent
+} from "./RlmTypes"
 import { RunTraceWriter } from "./RunTraceWriter"
 import { makeCallVariableSpace } from "./VariableSpace"
 import { getCallStateOption, getCallStateOrWarn, deleteCallState, setCallState } from "./scheduler/CallStateStore"
@@ -55,10 +65,12 @@ export interface RunSchedulerOptions {
   readonly query: string
   readonly context: string
   readonly contextMetadata?: ContextMetadata
+  readonly mediaAttachments?: ReadonlyArray<MediaAttachment>
   readonly depth?: number
   readonly rootCallId?: CallId
   readonly tools?: ReadonlyArray<RlmToolAny>
   readonly outputJsonSchema?: object
+  readonly returnPartialOutcome?: boolean
 }
 
 const formatExecutionError = (error: unknown): string => {
@@ -71,7 +83,7 @@ const formatExecutionError = (error: unknown): string => {
 
 // --- Scheduler ---
 
-export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSchedulerOptions) {
+const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(options: RunSchedulerOptions) {
   const runtime = yield* RlmRuntime
   const rootCallId = options.rootCallId ?? CallId("root")
   const rootDepth = options.depth ?? 0
@@ -96,13 +108,42 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
   const stallConsecutiveLimit = Math.max(1, config.stallConsecutiveLimit ?? 3)
   const stallResponseMaxChars = Math.max(0, config.stallResponseMaxChars ?? 24)
 
-  const resultDeferred = yield* Deferred.make<FinalAnswerPayload, RlmError>()
+  const resultDeferred = yield* Deferred.make<CompletionOutcome, RlmError>()
+
+  const rememberPartialOutcome = (callId: CallId, partial: PartialResult) =>
+    Ref.update(runtime.partialOutcomesRef, (current) =>
+      new Map([...current, [callId, partial]])
+    )
+
+  const takePartialOutcome = (callId: CallId) =>
+    Ref.modify(runtime.partialOutcomesRef, (current) => {
+      const partial = current.get(callId)
+      const next = new Map(current)
+      next.delete(callId)
+      return [partial, next] as const
+    })
 
   const resolveBridgeDeferred = (bridgeRequestId: BridgeRequestId, value: unknown) =>
     bridgeStore.resolve(bridgeRequestId, value).pipe(Effect.asVoid)
 
   const failBridgeDeferred = (bridgeRequestId: BridgeRequestId, error: unknown) =>
     bridgeStore.fail(bridgeRequestId, error).pipe(Effect.asVoid)
+
+  const budgetSnapshotForSandbox = Effect.gen(function*() {
+    const budget = yield* snapshot
+    const now = yield* Clock.currentTimeMillis
+    const elapsedMs = now - runtime.completionStartedAtMs
+    return {
+      iterationsRemaining: budget.iterationsRemaining,
+      llmCallsRemaining: budget.llmCallsRemaining,
+      tokenBudgetRemaining: Option.isSome(budget.tokenBudgetRemaining)
+        ? budget.tokenBudgetRemaining.value
+        : null,
+      totalTokensUsed: budget.totalTokensUsed,
+      elapsedMs,
+      maxTimeMs: config.maxTimeMs ?? null
+    }
+  })
 
   const deriveContextMetadata = (command: Extract<RlmCommand, { readonly _tag: "StartCall" }>): ContextMetadata | undefined => {
     if (command.callId === rootCallId) {
@@ -164,6 +205,143 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
     })
   }
 
+  const capturePartialResult = (
+    callState: CallContext,
+    reason: PartialResult["reason"]
+  ): Effect.Effect<PartialResult> =>
+    Effect.gen(function*() {
+      const transcript = yield* readTranscript(callState)
+      const vars = makeCallVariableSpace(callState)
+      yield* vars.sync.pipe(Effect.catchAll(() => Effect.void))
+      const cached = yield* vars.cached
+
+      const values: Record<string, unknown> = {}
+      for (const variable of cached.variables) {
+        if (variable.name === "context" || variable.name === "contextMeta" || variable.name === "query") {
+          continue
+        }
+        values[variable.name] = yield* vars.read(variable.name).pipe(
+          Effect.catchAll((error) =>
+            Effect.succeed(`(read failed: ${formatExecutionError(error)})`))
+        )
+      }
+
+      return {
+        source: "partial",
+        reason,
+        transcript,
+        variables: values
+      } satisfies PartialResult
+    })
+
+  const attemptExtractFallback = (
+    callState: CallContext,
+    reason: PartialResult["reason"],
+    commandTag: RlmCommand["_tag"]
+  ) =>
+    Effect.gen(function*() {
+      const reserveExit = yield* Effect.exit(reserveLlmCall(callState.callId))
+      if (Exit.isFailure(reserveExit)) {
+        return {
+          _tag: "Partial",
+          payload: yield* capturePartialResult(callState, reason)
+        } satisfies CompletionOutcome
+      }
+
+      const transcript = yield* readTranscript(callState)
+      const extractPrompt = buildExtractPrompt({
+        systemPrompt: buildExtractSystemPrompt(callState.outputJsonSchema),
+        query: callState.query,
+        ...(callState.contextMetadata !== undefined || callState.context.length > 0
+          ? { contextMetadata: callState.contextMetadata ?? analyzeContext(callState.context) }
+          : {}),
+        transcript,
+        enablePromptCaching: config.enablePromptCaching
+      })
+
+      const extractOutputMode = callState.outputJsonSchema !== undefined ? "structured" as const : "plain" as const
+      const extractToolkit = buildSubmitToolkit(extractOutputMode)
+      const response = yield* withLlmPermit(
+        rlmModel.generateText({
+          prompt: extractPrompt,
+          depth: callState.depth,
+          isSubCall: callState.parentBridgeRequestId !== undefined,
+          toolkit: extractToolkit,
+          toolChoice: { tool: SUBMIT_TOOL_NAME },
+          disableToolCallResolution: true
+        })
+      ).pipe(
+        Effect.catchAll((error) =>
+          Effect.gen(function*() {
+            yield* publishSchedulerWarning({
+              code: "TOOLKIT_DEGRADED",
+              message: `Tool-enabled extract failed; retrying extract without tool calling (${formatExecutionError(error)}).`,
+              callId: callState.callId,
+              commandTag
+            })
+            const fallbackReserveExit = yield* Effect.exit(reserveLlmCall(callState.callId))
+            if (Exit.isFailure(fallbackReserveExit)) {
+              return yield* new BudgetExhaustedError({
+                resource: "llmCalls",
+                callId: callState.callId,
+                remaining: 0
+              })
+            }
+            return yield* withLlmPermit(
+              rlmModel.generateText({
+                prompt: extractPrompt,
+                depth: callState.depth,
+                isSubCall: callState.parentBridgeRequestId !== undefined,
+                toolChoice: "none"
+              })
+            )
+          })
+        )
+      )
+
+      yield* recordTokens(callState.callId, response.usage.totalTokens)
+      yield* publishEvent(RlmEvent.ModelResponse({
+        completionId: runtime.completionId,
+        callId: callState.callId,
+        depth: callState.depth,
+        text: response.text,
+        usage: {
+          ...(response.usage.inputTokens !== undefined ? { inputTokens: response.usage.inputTokens } : {}),
+          ...(response.usage.outputTokens !== undefined ? { outputTokens: response.usage.outputTokens } : {}),
+          ...(response.usage.totalTokens !== undefined ? { totalTokens: response.usage.totalTokens } : {}),
+          ...(response.usage.reasoningTokens !== undefined ? { reasoningTokens: response.usage.reasoningTokens } : {}),
+          ...(response.usage.cachedInputTokens !== undefined ? { cachedInputTokens: response.usage.cachedInputTokens } : {})
+        }
+      }))
+
+      const submitAnswer = extractSubmitAnswer(response, {
+        outputMode: callState.outputJsonSchema !== undefined ? "structured" : "plain"
+      })
+      if (submitAnswer._tag === "Found") {
+        const resolved = yield* Effect.exit(resolveSubmitPayload(callState, submitAnswer.value, response.text))
+        if (Exit.isSuccess(resolved)) {
+          return {
+            _tag: "Final",
+            payload: resolved.value
+          } satisfies CompletionOutcome
+        }
+      }
+
+      return {
+        _tag: "Partial",
+        payload: yield* capturePartialResult(callState, reason)
+      } satisfies CompletionOutcome
+    }).pipe(
+      Effect.catchAll(() =>
+        Effect.gen(function*() {
+          return {
+            _tag: "Partial",
+            payload: yield* capturePartialResult(callState, reason)
+          } satisfies CompletionOutcome
+        })
+      )
+    )
+
   // --- handleStartCall ---
 
   const handleStartCall = (command: Extract<RlmCommand, { readonly _tag: "StartCall" }>) =>
@@ -183,6 +361,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         const sandbox = yield* sandboxFactory.create({
           callId: command.callId,
           depth: command.depth,
+          hasMediaAttachments: command.mediaAttachments !== undefined && command.mediaAttachments.length > 0,
           ...(toolDescriptorsForSandbox !== undefined && toolDescriptorsForSandbox.length > 0
             ? { tools: toolDescriptorsForSandbox }
             : {})
@@ -195,6 +374,9 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           depth: command.depth,
           query: command.query,
           context: command.context,
+          ...(command.mediaAttachments !== undefined && command.mediaAttachments.length > 0
+            ? { mediaAttachments: command.mediaAttachments }
+            : {}),
           ...(contextMetadata !== undefined
             ? { contextMetadata }
             : {}),
@@ -304,6 +486,18 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         })
       }
 
+      if (config.maxTimeMs !== undefined) {
+        const now = yield* Clock.currentTimeMillis
+        const elapsedMs = now - runtime.completionStartedAtMs
+        if (elapsedMs >= config.maxTimeMs) {
+          return yield* new BudgetExhaustedError({
+            resource: "time",
+            callId: callState.callId,
+            remaining: 0
+          })
+        }
+      }
+
       yield* consumeIteration(callState.callId)
 
       const budget = yield* snapshot
@@ -336,8 +530,20 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
           maxDepth: config.maxDepth,
           budget: {
             iterationsRemaining: config.maxIterations - (iteration + 1),
-            llmCallsRemaining: budget.llmCallsRemaining
+            llmCallsRemaining: budget.llmCallsRemaining,
+            ...(Option.isSome(budget.tokenBudgetRemaining)
+              ? { tokenBudgetRemaining: budget.tokenBudgetRemaining.value }
+              : {}),
+            totalTokensUsed: budget.totalTokensUsed,
+            elapsedMs: Date.now() - runtime.completionStartedAtMs,
+            ...(config.maxTimeMs !== undefined ? { maxTimeMs: config.maxTimeMs } : {})
           },
+          ...(config.namedModels !== undefined
+            ? { namedModelNames: Object.keys(config.namedModels) }
+            : {}),
+          ...(callState.mediaAttachments !== undefined
+            ? { mediaNames: callState.mediaAttachments.map((attachment) => attachment.name) }
+            : {}),
           ...(toolDescriptors !== undefined && toolDescriptors.length > 0
             ? { tools: toolDescriptors }
             : {}),
@@ -362,10 +568,13 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       const isSubCall = callState.parentBridgeRequestId !== undefined
       const outputMode = callState.outputJsonSchema !== undefined ? "structured" as const : "plain" as const
 
-      // Gate SUBMIT tool: only expose when code has been executed (model has done real work).
-      // For no-context or trivial-context calls (< 200 chars), SUBMIT is always available
-      // since there's no meaningful data to explore first.
-      const submitReady = (yield* hasCodeExecuted(callState)) || callState.context.length < 200
+      // Gate SUBMIT tool: only expose when model has done meaningful work.
+      // For large-context calls, require both code execution AND a minimum iteration count
+      // to prevent eager models (Gemini) from submitting after a single exploratory step.
+      // For no-context or trivial-context calls (< 200 chars), SUBMIT is always available.
+      const currentIteration = yield* readIteration(callState)
+      const submitReady = callState.context.length < 200
+        || ((yield* hasCodeExecuted(callState)) && currentIteration >= 3)
 
       const response = submitReady
         ? yield* withLlmPermit(
@@ -532,148 +741,39 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
     }).pipe(
       Effect.catchTag("BudgetExhaustedError", (err) =>
         Effect.gen(function*() {
-          // Non-iteration budget exhaustion → hard fail as before
-          if (err.resource !== "iterations") {
-            return yield* enqueueOrWarn(RlmCommand.FailCall({
-              callId: command.callId,
-              error: err
-            }))
-          }
-
-          // Get call state — need transcript for extract prompt
           const callStateOption = yield* getCallStateOption(command.callId)
           if (Option.isNone(callStateOption)) {
             return yield* enqueueOrWarn(RlmCommand.FailCall({
               callId: command.callId,
-              error: new NoFinalAnswerError({ callId: command.callId, maxIterations: config.maxIterations })
+              error: err.resource === "iterations"
+                ? new NoFinalAnswerError({ callId: command.callId, maxIterations: config.maxIterations })
+                : err
             }))
           }
           const callState = callStateOption.value
 
-          // Attempt extract: reserve LLM call budget (if exhausted, hard fail)
-          const reserveExit = yield* Effect.exit(reserveLlmCall(callState.callId))
-          if (Exit.isFailure(reserveExit)) {
-            return yield* enqueueOrWarn(RlmCommand.FailCall({
-              callId: command.callId,
-              error: new NoFinalAnswerError({ callId: command.callId, maxIterations: config.maxIterations })
-            }))
-          }
-
-          const transcript = yield* readTranscript(callState)
-
-          // Build extract prompt with full transcript
-          const extractPrompt = buildExtractPrompt({
-            systemPrompt: buildExtractSystemPrompt(callState.outputJsonSchema),
-            query: callState.query,
-            ...(callState.contextMetadata !== undefined || callState.context.length > 0
-              ? { contextMetadata: callState.contextMetadata ?? analyzeContext(callState.context) }
-              : {}),
-            transcript,
-            enablePromptCaching: config.enablePromptCaching
-          })
-
-          const extractOutputMode = callState.outputJsonSchema !== undefined ? "structured" as const : "plain" as const
-          const extractToolkit = buildSubmitToolkit(extractOutputMode)
-          const response = yield* withLlmPermit(
-            rlmModel.generateText({
-              prompt: extractPrompt,
-              depth: callState.depth,
-              isSubCall: callState.parentBridgeRequestId !== undefined,
-              toolkit: extractToolkit,
-              toolChoice: { tool: SUBMIT_TOOL_NAME },
-              disableToolCallResolution: true
-            })
-          ).pipe(
-            Effect.catchAll((error) =>
-              Effect.gen(function*() {
-                yield* publishSchedulerWarning({
-                  code: "TOOLKIT_DEGRADED",
-                  message: `Tool-enabled extract failed; retrying extract without tool calling (${formatExecutionError(error)}). Text-mode fallback does not parse textual SUBMIT({ variable: ... }) instructions.`,
-                  callId: callState.callId,
-                  commandTag: command._tag
-                })
-
-                // Fallback extract consumes another LLM budget slot.
-                yield* reserveLlmCall(callState.callId)
-
-                return yield* withLlmPermit(
-                  rlmModel.generateText({
-                    prompt: extractPrompt,
-                    depth: callState.depth,
-                    isSubCall: callState.parentBridgeRequestId !== undefined,
-                    toolChoice: "none"
-                  })
-                )
-              })
-            )
-          )
-          yield* recordTokens(callState.callId, response.usage.totalTokens)
-
-          // Publish model response event for observability
-          yield* publishEvent(RlmEvent.ModelResponse({
-            completionId: runtime.completionId,
-            callId: callState.callId,
-            depth: callState.depth,
-            text: response.text,
-            usage: {
-              ...(response.usage.inputTokens !== undefined ? { inputTokens: response.usage.inputTokens } : {}),
-              ...(response.usage.outputTokens !== undefined ? { outputTokens: response.usage.outputTokens } : {}),
-              ...(response.usage.totalTokens !== undefined ? { totalTokens: response.usage.totalTokens } : {}),
-              ...(response.usage.reasoningTokens !== undefined ? { reasoningTokens: response.usage.reasoningTokens } : {}),
-              ...(response.usage.cachedInputTokens !== undefined
-                ? { cachedInputTokens: response.usage.cachedInputTokens }
-                : {})
-            }
-          }))
-
-          const submitAnswer = extractSubmitAnswer(response, {
-            outputMode: callState.outputJsonSchema !== undefined ? "structured" : "plain"
-          })
-          if (submitAnswer._tag === "Found") {
-            const resolvedSubmit = yield* resolveSubmitPayload(callState, submitAnswer.value, response.text).pipe(
-              Effect.catchAll((error) =>
-                Effect.gen(function*() {
-                  yield* enqueueOrWarn(RlmCommand.FailCall({
-                    callId: command.callId,
-                    error
-                  }))
-                  return undefined
-                })
-              )
-            )
-            if (resolvedSubmit === undefined) return
-
+          const fallbackOutcome = yield* attemptExtractFallback(callState, err.resource, command._tag)
+          if (fallbackOutcome._tag === "Final") {
             yield* enqueueOrWarn(RlmCommand.Finalize({
               callId: callState.callId,
-              payload: resolvedSubmit
+              payload: fallbackOutcome.payload
             }))
             return
           }
 
-          if (submitAnswer._tag === "Invalid") {
-            yield* enqueueOrWarn(RlmCommand.FailCall({
-              callId: command.callId,
-              error: new OutputValidationError({
-                message: submitAnswer.message,
-                raw: response.text
+          yield* rememberPartialOutcome(callState.callId, fallbackOutcome.payload)
+          const mappedError = err.resource === "iterations"
+            ? new NoFinalAnswerError({ callId: command.callId, maxIterations: config.maxIterations })
+            : new BudgetExhaustedError({
+                resource: err.resource,
+                callId: command.callId,
+                remaining: 0
               })
-            }))
-            return
-          }
-
           yield* enqueueOrWarn(RlmCommand.FailCall({
             callId: command.callId,
-            error: new NoFinalAnswerError({ callId: command.callId, maxIterations: config.maxIterations })
+            error: mappedError
           }))
-        }).pipe(
-          // If the extract call itself fails, fall back to NoFinalAnswerError
-          Effect.catchAll(() =>
-            enqueueOrWarn(RlmCommand.FailCall({
-              callId: command.callId,
-              error: new NoFinalAnswerError({ callId: command.callId, maxIterations: config.maxIterations })
-            }))
-          )
-        )
+        })
       ),
       Effect.catchAll((error) =>
         enqueueOrWarn(RlmCommand.FailCall({
@@ -793,21 +893,35 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
 
   const handleHandleBridgeCall = (command: Extract<RlmCommand, { readonly _tag: "HandleBridgeCall" }>) =>
     Effect.gen(function*() {
-      const runOneShotSubCall = (query: string, context: string, depth: number) =>
+      const runOneShotSubCall = (options: {
+        readonly query: string
+        readonly context: string
+        readonly depth: number
+        readonly namedModel?: string
+        readonly media?: ReadonlyArray<MediaAttachment>
+      }) =>
         Effect.gen(function*() {
-          const oneShotPrompt = buildOneShotPrompt({
-            systemPrompt: buildOneShotSystemPrompt(),
-            query,
-            context,
-            enablePromptCaching: config.enablePromptCaching
-          })
+          const oneShotPrompt = options.media !== undefined && options.media.length > 0
+            ? buildOneShotPromptWithMedia({
+                systemPrompt: buildOneShotSystemPrompt(),
+                query: options.query,
+                media: options.media,
+                enablePromptCaching: config.enablePromptCaching
+              })
+            : buildOneShotPrompt({
+                systemPrompt: buildOneShotSystemPrompt(),
+                query: options.query,
+                context: options.context,
+                enablePromptCaching: config.enablePromptCaching
+              })
 
           yield* reserveLlmCall(command.callId)
           const response = yield* withLlmPermit(
             rlmModel.generateText({
               prompt: oneShotPrompt,
-              depth,
-              isSubCall: true
+              depth: options.depth,
+              isSubCall: true,
+              ...(options.namedModel !== undefined ? { namedModel: options.namedModel } : {})
             })
           )
           yield* recordTokens(command.callId, response.usage.totalTokens)
@@ -836,6 +950,11 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         depth: callState.depth,
         method: command.method
       }))
+
+      if (command.method === "budget") {
+        yield* resolveBridgeDeferred(command.bridgeRequestId, yield* budgetSnapshotForSandbox)
+        return
+      }
 
       if (command.method === "llm_query_batched") {
         if (!config.enableLlmQueryBatched) {
@@ -908,7 +1027,11 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             const results = yield* Effect.forEach(
               queries,
               (query, index) =>
-                runOneShotSubCall(query, contexts?.[index] ?? "", callState.depth + 1).pipe(
+                runOneShotSubCall({
+                  query,
+                  context: contexts?.[index] ?? "",
+                  depth: callState.depth + 1
+                }).pipe(
                   Effect.mapError((error) =>
                     new SandboxError({
                       message: `llm_query_batched item ${index} failed: ${formatExecutionError(error)}`
@@ -923,6 +1046,67 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
             Effect.catchAll((error) =>
               failBridgeDeferred(command.bridgeRequestId, error)
             )
+          ),
+          callState.callScope
+        )
+        return
+      }
+
+      if (command.method === "llm_query_with_media") {
+        const llmQueryArg = command.args[0]
+        if (typeof llmQueryArg !== "string" || llmQueryArg.trim().length === 0) {
+          yield* failBridgeDeferred(
+            command.bridgeRequestId,
+            "llm_query_with_media requires a non-empty prompt string as the first argument"
+          )
+          return
+        }
+
+        const mediaNames = command.args.slice(1)
+        if (mediaNames.length === 0) {
+          yield* failBridgeDeferred(command.bridgeRequestId, "llm_query_with_media requires at least one media name")
+          return
+        }
+        if (callState.mediaAttachments === undefined || callState.mediaAttachments.length === 0) {
+          yield* failBridgeDeferred(command.bridgeRequestId, "No media attachments are registered for this call")
+          return
+        }
+
+        const mediaByName = new Map(callState.mediaAttachments.map((attachment) => [attachment.name, attachment]))
+        const selected: Array<MediaAttachment> = []
+        for (let index = 0; index < mediaNames.length; index += 1) {
+          const raw = mediaNames[index]
+          if (typeof raw !== "string" || raw.trim().length === 0) {
+            yield* failBridgeDeferred(
+              command.bridgeRequestId,
+              `llm_query_with_media media name at index ${index} must be a non-empty string`
+            )
+            return
+          }
+          const attachment = mediaByName.get(raw)
+          if (attachment === undefined) {
+            yield* failBridgeDeferred(command.bridgeRequestId, `Unknown media attachment "${raw}"`)
+            return
+          }
+          selected.push(attachment)
+        }
+
+        yield* Effect.forkIn(
+          Effect.gen(function*() {
+            const oneShotResponseText = yield* runOneShotSubCall({
+              query: llmQueryArg,
+              context: "",
+              depth: callState.depth + 1,
+              media: selected
+            })
+            yield* resolveBridgeDeferred(command.bridgeRequestId, oneShotResponseText)
+          }).pipe(
+            Effect.catchAllCause((cause) => {
+              const message = Cause.isFailType(cause)
+                ? ("message" in cause.error ? (cause.error as { message: string }).message : String(cause.error))
+                : Cause.pretty(cause)
+              return failBridgeDeferred(command.bridgeRequestId, message)
+            })
           ),
           callState.callScope
         )
@@ -974,15 +1158,37 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
         return
       }
 
-      if (callState.depth + 1 >= config.maxDepth) {
+      const llmOptionsArg = command.args[2]
+      if (
+        llmOptionsArg !== undefined &&
+        (typeof llmOptionsArg !== "object" || llmOptionsArg === null || Array.isArray(llmOptionsArg))
+      ) {
+        yield* failBridgeDeferred(
+          command.bridgeRequestId,
+          "llm_query options must be an object when provided"
+        )
+        return
+      }
+      const llmOptions = llmOptionsArg as { readonly model?: unknown } | undefined
+      const namedModel = llmOptions?.model
+      if (namedModel !== undefined && typeof namedModel !== "string") {
+        yield* failBridgeDeferred(
+          command.bridgeRequestId,
+          "llm_query options.model must be a string when provided"
+        )
+        return
+      }
+
+      if (callState.depth + 1 >= config.maxDepth || namedModel !== undefined) {
         // At max depth: one-shot model call (no REPL protocol) with budget reservation
         yield* Effect.forkIn(
           Effect.gen(function*() {
-            const oneShotResponseText = yield* runOneShotSubCall(
-              llmQueryArg,
-              llmContextArg ?? "",
-              callState.depth + 1
-            )
+            const oneShotResponseText = yield* runOneShotSubCall({
+              query: llmQueryArg,
+              context: llmContextArg ?? "",
+              depth: callState.depth + 1,
+              ...(namedModel !== undefined ? { namedModel } : {})
+            })
             yield* resolveBridgeDeferred(command.bridgeRequestId, oneShotResponseText)
           }).pipe(
             Effect.catchAllCause((cause) => {
@@ -1058,7 +1264,10 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       } else if (command.callId === rootCallId) {
         // Fail all outstanding bridge deferreds before queue shutdown
         yield* bridgeStore.failAll("RLM completion finished")
-        yield* Deferred.succeed(resultDeferred, command.payload)
+        yield* Deferred.succeed(resultDeferred, {
+          _tag: "Final",
+          payload: command.payload
+        })
         yield* Queue.shutdown(runtime.commands)
       }
     })
@@ -1071,6 +1280,7 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       const callState = Option.isSome(callStateOption)
         ? callStateOption.value
         : undefined
+      const partial = yield* takePartialOutcome(command.callId)
       const depth = callState?.depth ?? 0
 
       yield* publishEvent(RlmEvent.CallFailed({
@@ -1090,7 +1300,14 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       } else if (command.callId === rootCallId) {
         // Fail all outstanding bridge deferreds before queue shutdown
         yield* bridgeStore.failAll("RLM completion failed")
-        yield* Deferred.fail(resultDeferred, command.error)
+        if (partial !== undefined && options.returnPartialOutcome === true) {
+          yield* Deferred.succeed(resultDeferred, {
+            _tag: "Partial",
+            payload: partial
+          })
+        } else {
+          yield* Deferred.fail(resultDeferred, command.error)
+        }
         yield* Queue.shutdown(runtime.commands)
       }
     })
@@ -1136,6 +1353,9 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       depth: rootDepth,
       query: options.query,
       context: options.context,
+      ...(options.mediaAttachments !== undefined && options.mediaAttachments.length > 0
+        ? { mediaAttachments: options.mediaAttachments }
+        : {}),
       ...(options.tools !== undefined && options.tools.length > 0
         ? { tools: options.tools }
         : {}),
@@ -1170,4 +1390,33 @@ export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSch
       })
     )
   )
+})
+
+export const runSchedulerWithOutcome = Effect.fn("Scheduler.runWithOutcome")(function*(options: RunSchedulerOptions) {
+  return yield* runSchedulerInternal({
+    ...options,
+    returnPartialOutcome: true
+  })
+})
+
+export const runScheduler = Effect.fn("Scheduler.run")(function*(options: RunSchedulerOptions) {
+  const outcome = yield* runSchedulerInternal(options)
+  if (outcome._tag === "Final") {
+    return outcome.payload
+  }
+
+  const config = yield* RlmConfig
+  const callId = options.rootCallId ?? CallId("root")
+  if (outcome.payload.reason === "iterations") {
+    return yield* new NoFinalAnswerError({
+      callId,
+      maxIterations: config.maxIterations
+    })
+  }
+
+  return yield* new BudgetExhaustedError({
+    resource: outcome.payload.reason,
+    callId,
+    remaining: 0
+  })
 })

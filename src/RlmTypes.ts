@@ -17,6 +17,7 @@ export class BudgetState extends Data.Class<{
   readonly iterationsRemaining: number
   readonly llmCallsRemaining: number
   readonly tokenBudgetRemaining: Option.Option<number>
+  readonly totalTokensUsed: number
 }> {}
 
 export class TranscriptEntry extends Data.Class<{
@@ -48,6 +49,29 @@ export type FinalAnswerPayload =
       readonly value: unknown
     }
 
+export interface PartialResult {
+  readonly source: "partial"
+  readonly reason: "iterations" | "llmCalls" | "tokens" | "time"
+  readonly transcript: ReadonlyArray<TranscriptEntry>
+  readonly variables: Record<string, unknown>
+}
+
+export type CompletionOutcome =
+  | {
+      readonly _tag: "Final"
+      readonly payload: FinalAnswerPayload
+    }
+  | {
+      readonly _tag: "Partial"
+      readonly payload: PartialResult
+    }
+
+export interface MediaAttachment {
+  readonly name: string
+  readonly mediaType: string
+  readonly data: string | Uint8Array | URL
+}
+
 // --- Tagged Enums ---
 
 export type RlmCommand = Data.TaggedEnum<{
@@ -56,6 +80,7 @@ export type RlmCommand = Data.TaggedEnum<{
     readonly depth: number
     readonly query: string
     readonly context: string
+    readonly mediaAttachments?: ReadonlyArray<MediaAttachment>
     readonly parentBridgeRequestId?: BridgeRequestId
     readonly tools?: ReadonlyArray<RlmToolAny>
     readonly outputJsonSchema?: object

@@ -1,9 +1,27 @@
+import { WorkerRunner } from "@effect/platform"
+import { BunWorkerRunner } from "@effect/platform-bun"
+import { Effect, Stream } from "effect"
+import {
+  RunnerBridgeFailedRequest,
+  RunnerBridgeResultRequest,
+  RunnerExecRequest,
+  RunnerGetVarRequest,
+  RunnerInitRequest,
+  RunnerListVarsRequest,
+  RunnerSetVarRequest,
+  RunnerShutdownRequest,
+  SandboxWorkerRunnerRequest,
+  type RunnerWorkerFrame
+} from "./SandboxWorkerRunnerProtocol"
+
 /**
- * Sandbox worker — standalone Bun subprocess entry point.
- * Does NOT import Effect. Communicates with host via Bun IPC (JSON serialization).
+ * Sandbox worker entry point.
  *
- * Trust model: process-level isolation only.
- * "strict" mode is best-effort JavaScript-level hardening, not a security boundary.
+ * Modes:
+ * - Subprocess IPC mode (`Bun.spawn(..., { ipc })`) for strict isolation path.
+ * - Effect WorkerRunner mode (`new Worker(...)`) for permissive transport path.
+ *
+ * Trust model: strict mode relies on process isolation; JavaScript hardening remains best effort.
  */
 
 // --- State ---
@@ -12,7 +30,29 @@ const vars = new Map<string, unknown>()
 let workerCallId = "unknown"
 let workerDepth = 0
 let sandboxMode: "permissive" | "strict" = "permissive"
-let toolFunctions: Record<string, (...args: unknown[]) => Promise<unknown>> = {}
+let hasMediaAttachments = false
+let toolNames: ReadonlyArray<string> = []
+
+const hasProcessIpc =
+  typeof process !== "undefined" &&
+  typeof process.send === "function" &&
+  typeof process.on === "function"
+
+const sendToHost = (message: unknown): void => {
+  if (hasProcessIpc) {
+    process.send!(message)
+    return
+  }
+  throw new Error("sendToHost is only available in subprocess IPC mode")
+}
+
+const closeWorker = (code: number): void => {
+  if (hasProcessIpc) {
+    process.exit(code)
+    return
+  }
+  throw new Error("closeWorker is only available in subprocess IPC mode")
+}
 
 // Pending bridge calls: requestId → { resolve, reject }
 const pendingBridge = new Map<
@@ -52,8 +92,10 @@ const STRICT_BLOCKLIST: ReadonlyArray<{
 const makeStrictScope = (
   print: (...args: unknown[]) => void,
   __vars: unknown,
-  llm_query: (query: string, context?: string) => Promise<unknown>,
+  llm_query: (query: string, context?: string, options?: { model?: string }) => Promise<unknown>,
   llm_query_batched: (queries: ReadonlyArray<string>, contexts?: ReadonlyArray<string>) => Promise<unknown>,
+  llm_query_with_media: (query: string, ...mediaNames: ReadonlyArray<string>) => Promise<unknown>,
+  budget: () => Promise<unknown>,
   init_corpus: (documents: unknown, options?: unknown) => Promise<unknown>,
   init_corpus_from_context: (options?: unknown) => Promise<unknown>,
   tools?: Record<string, (...args: unknown[]) => Promise<unknown>>
@@ -64,6 +106,8 @@ const makeStrictScope = (
     __vars,
     llm_query,
     llm_query_batched,
+    llm_query_with_media,
+    budget,
     init_corpus,
     init_corpus_from_context,
     undefined,
@@ -155,7 +199,10 @@ function checkFrameSize(message: unknown): boolean {
   }
 }
 
-function safeSend(message: unknown): boolean {
+function safeSend(
+  message: unknown,
+  emit: (message: unknown) => void = sendToHost
+): boolean {
   const msg = message as Record<string, unknown>
   if (!checkFrameSize(message)) {
     if (msg._tag === "BridgeCall") {
@@ -174,17 +221,44 @@ function safeSend(message: unknown): boolean {
       requestId: String(msg.requestId ?? "unknown"),
       message: "Response exceeds max frame size"
     }
-    process.send!(fallback)
+    emit(fallback)
     return false
   }
-  process.send!(message)
+  emit(message)
   return true
 }
 
+const makeToolFunctions = (emitFrame: (message: unknown) => boolean): Record<string, (...args: unknown[]) => Promise<unknown>> =>
+  Object.fromEntries(
+    toolNames.map((toolName) => [
+      toolName,
+      async (...args: unknown[]): Promise<unknown> => {
+        if (sandboxMode === "strict") {
+          throw new Error("Bridge disabled in strict sandbox mode")
+        }
+        const bridgeRequestId = crypto.randomUUID()
+        return new Promise((resolve, reject) => {
+          pendingBridge.set(bridgeRequestId, { resolve, reject })
+          emitFrame({
+            _tag: "BridgeCall",
+            requestId: bridgeRequestId,
+            method: toolName,
+            args
+          })
+        })
+      }
+    ])
+  )
+
 // --- Code execution ---
 
-async function executeCode(requestId: string, code: string): Promise<void> {
+async function executeCode(
+  requestId: string,
+  code: string,
+  emitFrame: (message: unknown) => boolean = (message) => safeSend(message)
+): Promise<void> {
   const output: string[] = []
+  const activeToolFunctions = makeToolFunctions(emitFrame)
 
   // Injected bindings
   const print = (...args: unknown[]) => {
@@ -204,20 +278,39 @@ async function executeCode(requestId: string, code: string): Promise<void> {
     }
   })
 
-  const llm_query = async (query: string, context?: string): Promise<unknown> => {
+  const llm_query = async (
+    query: string,
+    contextOrOptions?: string | { model?: string },
+    optionsArg?: { model?: string }
+  ): Promise<unknown> => {
     if (sandboxMode === "strict") {
       throw new Error("Bridge disabled in strict sandbox mode")
+    }
+
+    let context: string | undefined
+    let options: { model?: string } | undefined
+    if (typeof contextOrOptions === "string") {
+      context = contextOrOptions
+      options = optionsArg
+    } else if (contextOrOptions !== undefined) {
+      options = contextOrOptions
     }
 
     const bridgeRequestId = crypto.randomUUID()
 
     return new Promise((resolve, reject) => {
       pendingBridge.set(bridgeRequestId, { resolve, reject })
-      safeSend({
+      const args: Array<unknown> = [query]
+      if (context !== undefined) args.push(context)
+      if (options !== undefined) {
+      if (context === undefined) args.push("")
+        args.push(options)
+      }
+      emitFrame({
         _tag: "BridgeCall",
         requestId: bridgeRequestId,
         method: "llm_query",
-        args: context !== undefined ? [query, context] : [query]
+        args
       })
     })
   }
@@ -234,11 +327,51 @@ async function executeCode(requestId: string, code: string): Promise<void> {
 
     return new Promise((resolve, reject) => {
       pendingBridge.set(bridgeRequestId, { resolve, reject })
-      safeSend({
+      emitFrame({
         _tag: "BridgeCall",
         requestId: bridgeRequestId,
         method: "llm_query_batched",
         args: contexts !== undefined ? [queries, contexts] : [queries]
+      })
+    })
+  }
+
+  const llm_query_with_media = async (
+    query: string,
+    ...mediaNames: ReadonlyArray<string>
+  ): Promise<unknown> => {
+    if (sandboxMode === "strict") {
+      throw new Error("Bridge disabled in strict sandbox mode")
+    }
+    if (!hasMediaAttachments) {
+      throw new Error("No media attachments available in this run")
+    }
+
+    const bridgeRequestId = crypto.randomUUID()
+    return new Promise((resolve, reject) => {
+      pendingBridge.set(bridgeRequestId, { resolve, reject })
+      emitFrame({
+        _tag: "BridgeCall",
+        requestId: bridgeRequestId,
+        method: "llm_query_with_media",
+        args: [query, ...mediaNames]
+      })
+    })
+  }
+
+  const budget = async (): Promise<unknown> => {
+    if (sandboxMode === "strict") {
+      throw new Error("Bridge disabled in strict sandbox mode")
+    }
+
+    const bridgeRequestId = crypto.randomUUID()
+    return new Promise((resolve, reject) => {
+      pendingBridge.set(bridgeRequestId, { resolve, reject })
+      emitFrame({
+        _tag: "BridgeCall",
+        requestId: bridgeRequestId,
+        method: "budget",
+        args: []
       })
     })
   }
@@ -272,7 +405,7 @@ async function executeCode(requestId: string, code: string): Promise<void> {
       : fallback
 
   const toolOrThrow = (toolName: string): ((...args: unknown[]) => Promise<unknown>) => {
-    const fn = toolFunctions[toolName]
+    const fn = activeToolFunctions[toolName]
     if (fn) return fn
     throw new Error(`Required NLP tool "${toolName}" is unavailable in this run`)
   }
@@ -491,10 +624,10 @@ async function executeCode(requestId: string, code: string): Promise<void> {
       init_corpus_from_context
     }
     const injectedFunctions = {
-      ...toolFunctions,
+      ...activeToolFunctions,
       ...injectedHelpers
     }
-    const toolNames = Object.keys(injectedFunctions)
+    const injectedToolNames = Object.keys(injectedFunctions)
     const toolValues = Object.values(injectedFunctions)
 
     if (sandboxMode === "strict") {
@@ -503,6 +636,8 @@ async function executeCode(requestId: string, code: string): Promise<void> {
         __vars,
         llm_query,
         llm_query_batched,
+        llm_query_with_media,
+        budget,
         init_corpus,
         init_corpus_from_context,
         injectedFunctions
@@ -512,10 +647,12 @@ async function executeCode(requestId: string, code: string): Promise<void> {
         "__vars",
         "llm_query",
         "llm_query_batched",
+        "llm_query_with_media",
+        "budget",
         "init_corpus",
         "init_corpus_from_context",
         "__strictScope",
-        ...toolNames,
+        ...injectedToolNames,
         `
         with (__strictScope) {
           ${code}
@@ -527,6 +664,8 @@ async function executeCode(requestId: string, code: string): Promise<void> {
         __vars,
         llm_query,
         llm_query_batched,
+        llm_query_with_media,
+        budget,
         init_corpus,
         init_corpus_from_context,
         strictScope,
@@ -538,9 +677,11 @@ async function executeCode(requestId: string, code: string): Promise<void> {
         "__vars",
         "llm_query",
         "llm_query_batched",
+        "llm_query_with_media",
+        "budget",
         "init_corpus",
         "init_corpus_from_context",
-        ...toolNames,
+        ...injectedToolNames,
         code
       )
       await fn(
@@ -548,20 +689,22 @@ async function executeCode(requestId: string, code: string): Promise<void> {
         __vars,
         llm_query,
         llm_query_batched,
+        llm_query_with_media,
+        budget,
         init_corpus,
         init_corpus_from_context,
         ...toolValues
       )
     }
 
-    safeSend({
+    emitFrame({
       _tag: "ExecResult",
       requestId,
       output: output.join("\n")
     })
   } catch (err: unknown) {
     const error = err instanceof Error ? err : new Error(String(err))
-    safeSend({
+    emitFrame({
       _tag: "ExecError",
       requestId,
       message: error.message,
@@ -572,6 +715,111 @@ async function executeCode(requestId: string, code: string): Promise<void> {
 
 // --- Message dispatch ---
 
+const JS_IDENTIFIER_RE = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/
+const RESERVED_BINDINGS = new Set([
+  "print",
+  "__vars",
+  "llm_query",
+  "llm_query_batched",
+  "llm_query_with_media",
+  "budget",
+  "init_corpus",
+  "init_corpus_from_context",
+  "__strictScope"
+])
+
+const normalizeToolNames = (rawTools: unknown): ReadonlyArray<string> => {
+  if (!Array.isArray(rawTools)) return []
+  const names: Array<string> = []
+  for (const tool of rawTools) {
+    const toolName = String((tool as { readonly name?: unknown }).name ?? "")
+    if (!JS_IDENTIFIER_RE.test(toolName) || RESERVED_BINDINGS.has(toolName)) {
+      console.error(`[sandbox-worker] Skipping invalid tool name: ${toolName}`)
+      continue
+    }
+    names.push(toolName)
+  }
+  return names
+}
+
+const applyInitMessage = (msg: Record<string, unknown>): void => {
+  workerCallId = String(msg.callId ?? "unknown")
+  workerDepth = Number(msg.depth ?? 0)
+  sandboxMode = msg.sandboxMode === "strict" ? "strict" : "permissive"
+  hasMediaAttachments = msg.hasMediaAttachments === true
+  if (typeof msg.maxFrameBytes === "number" && msg.maxFrameBytes > 0 &&
+      Number.isInteger(msg.maxFrameBytes) && msg.maxFrameBytes <= 64 * 1024 * 1024) {
+    maxFrameBytes = msg.maxFrameBytes
+  }
+
+  toolNames = normalizeToolNames(msg.tools)
+  console.error(
+    `[sandbox-worker] Init: callId=${workerCallId} depth=${workerDepth} mode=${sandboxMode} maxFrameBytes=${maxFrameBytes} tools=${toolNames.join(",")}`
+  )
+}
+
+const listVariableMetadata = (): ReadonlyArray<{
+  readonly name: string
+  readonly type: string
+  readonly size?: number
+  readonly preview: string
+}> => {
+  const buildPreview = (value: unknown): { type: string; size?: number; preview: string } => {
+    if (value === null) return { type: "null", preview: "null" }
+    if (value === undefined) return { type: "undefined", preview: "undefined" }
+
+    if (typeof value === "string") {
+      return {
+        type: "string",
+        size: value.length,
+        preview: value.length > 200 ? value.slice(0, 200) + "..." : value
+      }
+    }
+
+    if (Array.isArray(value)) {
+      return {
+        type: "array",
+        size: value.length,
+        preview: `Array(${value.length})`
+      }
+    }
+
+    if (typeof value === "object") {
+      const keys = Object.keys(value as object)
+      return {
+        type: "object",
+        size: keys.length,
+        preview: `{${keys.slice(0, 5).join(", ")}${keys.length > 5 ? ", ..." : ""}}`
+      }
+    }
+
+    if (typeof value === "function") {
+      const fn = value as Function
+      return {
+        type: "function",
+        preview: `[Function ${fn.name || "anonymous"}]`
+      }
+    }
+
+    return {
+      type: typeof value,
+      preview: String(value).slice(0, 200)
+    }
+  }
+
+  return Array.from(vars.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, value]) => {
+      const { type, size, preview } = buildPreview(value)
+      return {
+        name,
+        type,
+        ...(size !== undefined ? { size } : {}),
+        preview
+      }
+    })
+}
+
 function handleMessage(message: unknown): void {
   if (typeof message !== "object" || message === null || !("_tag" in message)) {
     return
@@ -581,52 +829,7 @@ function handleMessage(message: unknown): void {
 
   switch (msg._tag) {
     case "Init": {
-      workerCallId = String(msg.callId ?? "unknown")
-      workerDepth = Number(msg.depth ?? 0)
-      sandboxMode = msg.sandboxMode === "strict" ? "strict" : "permissive"
-      if (typeof msg.maxFrameBytes === "number" && msg.maxFrameBytes > 0 &&
-          Number.isInteger(msg.maxFrameBytes) && msg.maxFrameBytes <= 64 * 1024 * 1024) {
-        maxFrameBytes = msg.maxFrameBytes
-      }
-
-      // Create tool bridge functions from tool descriptors
-      toolFunctions = {}
-      const jsIdentifierRe = /^[a-zA-Z_$][a-zA-Z0-9_$]*$/
-      const reservedBindings = new Set([
-        "print",
-        "__vars",
-        "llm_query",
-        "llm_query_batched",
-        "init_corpus",
-        "init_corpus_from_context",
-        "__strictScope"
-      ])
-      if (Array.isArray(msg.tools)) {
-        for (const tool of msg.tools) {
-          const toolName = String(tool.name)
-          if (!jsIdentifierRe.test(toolName) || reservedBindings.has(toolName)) {
-            console.error(`[sandbox-worker] Skipping invalid tool name: ${toolName}`)
-            continue
-          }
-          toolFunctions[toolName] = async (...args: unknown[]): Promise<unknown> => {
-            if (sandboxMode === "strict") {
-              throw new Error("Bridge disabled in strict sandbox mode")
-            }
-            const bridgeRequestId = crypto.randomUUID()
-            return new Promise((resolve, reject) => {
-              pendingBridge.set(bridgeRequestId, { resolve, reject })
-              safeSend({
-                _tag: "BridgeCall",
-                requestId: bridgeRequestId,
-                method: toolName,
-                args
-              })
-            })
-          }
-        }
-      }
-
-      console.error(`[sandbox-worker] Init: callId=${workerCallId} depth=${workerDepth} mode=${sandboxMode} maxFrameBytes=${maxFrameBytes} tools=${Object.keys(toolFunctions).join(",")}`)
+      applyInitMessage(msg)
       break
     }
 
@@ -661,61 +864,7 @@ function handleMessage(message: unknown): void {
 
     case "ListVarsRequest": {
       const requestId = String(msg.requestId)
-
-      const buildPreview = (value: unknown): { type: string; size?: number; preview: string } => {
-        if (value === null) return { type: "null", preview: "null" }
-        if (value === undefined) return { type: "undefined", preview: "undefined" }
-
-        if (typeof value === "string") {
-          return {
-            type: "string",
-            size: value.length,
-            preview: value.length > 200 ? value.slice(0, 200) + "..." : value
-          }
-        }
-
-        if (Array.isArray(value)) {
-          return {
-            type: "array",
-            size: value.length,
-            preview: `Array(${value.length})`
-          }
-        }
-
-        if (typeof value === "object") {
-          const keys = Object.keys(value as object)
-          return {
-            type: "object",
-            size: keys.length,
-            preview: `{${keys.slice(0, 5).join(", ")}${keys.length > 5 ? ", ..." : ""}}`
-          }
-        }
-
-        if (typeof value === "function") {
-          const fn = value as Function
-          return {
-            type: "function",
-            preview: `[Function ${fn.name || "anonymous"}]`
-          }
-        }
-
-        return {
-          type: typeof value,
-          preview: String(value).slice(0, 200)
-        }
-      }
-
-      const variables = Array.from(vars.entries())
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([name, value]) => {
-          const { type, size, preview } = buildPreview(value)
-          return {
-            name,
-            type,
-            ...(size !== undefined ? { size } : {}),
-            preview
-          }
-        })
+      const variables = listVariableMetadata()
 
       safeSend({ _tag: "ListVarsResult", requestId, variables })
       break
@@ -747,8 +896,8 @@ function handleMessage(message: unknown): void {
         pending.reject(new Error("Worker shutting down"))
         pendingBridge.delete(id)
       }
-      toolFunctions = {}
-      process.exit(0)
+      toolNames = []
+      closeWorker(0)
       break
     }
 
@@ -758,14 +907,99 @@ function handleMessage(message: unknown): void {
   }
 }
 
-// --- IPC listener ---
+// --- Host message listeners ---
 
-process.on("message", handleMessage)
-
-process.on("disconnect", () => {
-  for (const [id, pending] of pendingBridge) {
-    pending.reject(new Error("Parent process disconnected"))
-    pendingBridge.delete(id)
-  }
-  process.exit(1)
-})
+if (hasProcessIpc) {
+  process.on("message", handleMessage)
+  process.on("disconnect", () => {
+    for (const [id, pending] of pendingBridge) {
+      pending.reject(new Error("Parent process disconnected"))
+      pendingBridge.delete(id)
+    }
+    closeWorker(1)
+  })
+} else {
+  Effect.runFork(
+    BunWorkerRunner.launch(
+      WorkerRunner.layerSerialized(SandboxWorkerRunnerRequest, {
+        Init: (request: RunnerInitRequest) =>
+          Effect.sync(() => {
+            applyInitMessage(request as unknown as Record<string, unknown>)
+          }),
+        ExecRequest: (request: RunnerExecRequest) =>
+          Stream.asyncPush<RunnerWorkerFrame>((emit) =>
+            Effect.sync(() => {
+              void executeCode(
+                request.requestId,
+                request.code,
+                (message) => safeSend(message, (frame) => {
+                  emit.single(frame as RunnerWorkerFrame)
+                })
+              ).finally(() => {
+                emit.end()
+              })
+            })
+          ),
+        SetVar: (request: RunnerSetVarRequest) =>
+          Effect.sync(() => {
+            try {
+              vars.set(request.name, request.value)
+              return {
+                _tag: "SetVarAck" as const,
+                requestId: request.requestId
+              }
+            } catch (err: unknown) {
+              return {
+                _tag: "SetVarError" as const,
+                requestId: request.requestId,
+                message: err instanceof Error ? err.message : String(err)
+              }
+            }
+          }),
+        GetVarRequest: (request: RunnerGetVarRequest) =>
+          Effect.sync(() => ({
+            _tag: "GetVarResult" as const,
+            requestId: request.requestId,
+            value: vars.get(request.name)
+          })),
+        ListVarsRequest: (request: RunnerListVarsRequest) =>
+          Effect.sync(() => ({
+            _tag: "ListVarsResult" as const,
+            requestId: request.requestId,
+            variables: listVariableMetadata()
+          })),
+        BridgeResult: (request: RunnerBridgeResultRequest) =>
+          Effect.sync(() => {
+            const pending = pendingBridge.get(request.requestId)
+            if (pending) {
+              pendingBridge.delete(request.requestId)
+              pending.resolve(request.result)
+            }
+          }),
+        BridgeFailed: (request: RunnerBridgeFailedRequest) =>
+          Effect.sync(() => {
+            const pending = pendingBridge.get(request.requestId)
+            if (pending) {
+              pendingBridge.delete(request.requestId)
+              pending.reject(new Error(request.message))
+            }
+          }),
+        Shutdown: (_request: RunnerShutdownRequest) =>
+          Effect.sync(() => {
+            for (const [id, pending] of pendingBridge) {
+              pending.reject(new Error("Worker shutting down"))
+              pendingBridge.delete(id)
+            }
+            toolNames = []
+          })
+      })
+    ).pipe(
+      Effect.provide(BunWorkerRunner.layer),
+      Effect.catchAll((error) =>
+        Effect.sync(() => {
+          console.error("[sandbox-worker] WorkerRunner launch failed", error)
+        })
+      )
+    )
+  )
+}

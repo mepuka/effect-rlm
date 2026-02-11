@@ -1,6 +1,6 @@
 import { Effect, Ref, Scope } from "effect"
 import type { SandboxInstance, VariableMetadata } from "./Sandbox"
-import type { BridgeRequestId, CallId } from "./RlmTypes"
+import type { BridgeRequestId, CallId, MediaAttachment } from "./RlmTypes"
 import { TranscriptEntry } from "./RlmTypes"
 import type { RlmToolAny } from "./RlmTool"
 import type { ContextMetadata } from "./ContextMetadata"
@@ -17,6 +17,7 @@ export interface CallContext {
   readonly query: string
   readonly context: string
   readonly contextMetadata?: ContextMetadata
+  readonly mediaAttachments?: ReadonlyArray<MediaAttachment>
   readonly callScope: Scope.CloseableScope
   readonly sandbox: SandboxInstance
   readonly parentBridgeRequestId?: BridgeRequestId
@@ -36,6 +37,7 @@ export interface MakeCallContextOptions {
   readonly query: string
   readonly context: string
   readonly contextMetadata?: ContextMetadata
+  readonly mediaAttachments?: ReadonlyArray<MediaAttachment>
   readonly callScope: Scope.CloseableScope
   readonly sandbox: SandboxInstance
   readonly parentBridgeRequestId?: BridgeRequestId

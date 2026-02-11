@@ -1,4 +1,4 @@
-import { Context, Deferred, Duration, Effect, Exit, Layer, Queue } from "effect"
+import { Clock, Context, Deferred, Duration, Effect, Exit, Layer, Option, Queue, Ref } from "effect"
 import { SandboxError } from "./RlmError"
 import { RlmConfig } from "./RlmConfig"
 import { RlmRuntime } from "./Runtime"
@@ -25,6 +25,23 @@ export const BridgeHandlerLive: Layer.Layer<BridgeHandler, never, RlmRuntime | B
 
     return BridgeHandler.of({
       handle: ({ method, args, callerCallId }) => {
+        if (method === "budget") {
+          return Effect.gen(function*() {
+            const budget = yield* Ref.get(runtime.budgetRef)
+            const now = yield* Clock.currentTimeMillis
+            return {
+              iterationsRemaining: budget.iterationsRemaining,
+              llmCallsRemaining: budget.llmCallsRemaining,
+              tokenBudgetRemaining: Option.isSome(budget.tokenBudgetRemaining)
+                ? budget.tokenBudgetRemaining.value
+                : null,
+              totalTokensUsed: budget.totalTokensUsed,
+              elapsedMs: now - runtime.completionStartedAtMs,
+              maxTimeMs: config.maxTimeMs ?? null
+            }
+          })
+        }
+
         const bridgeRequestId = BridgeRequestId(crypto.randomUUID())
 
         return Effect.gen(function*() {

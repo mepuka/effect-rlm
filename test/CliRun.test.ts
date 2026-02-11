@@ -62,6 +62,14 @@ const makeRlmLayer = (
       onStream?.(options)
       return Stream.fromIterable(events)
     },
+    completeWithOutcome: ((_options: unknown) =>
+      Effect.succeed({
+        _tag: "Final" as const,
+        payload: {
+          source: "answer" as const,
+          answer: ""
+        }
+      })) as RlmService["completeWithOutcome"],
     complete: ((_options: unknown) => Effect.succeed("")) as RlmService["complete"]
   }
 

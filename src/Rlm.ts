@@ -3,11 +3,11 @@ import { BridgeHandlerLive } from "./BridgeHandler"
 import { RlmConfig } from "./RlmConfig"
 import { RlmModel } from "./RlmModel"
 import type { RlmError } from "./RlmError"
-import { OutputValidationError } from "./RlmError"
+import { BudgetExhaustedError, NoFinalAnswerError, OutputValidationError } from "./RlmError"
 import { RlmRuntime, RlmRuntimeLive } from "./Runtime"
-import { CallId, RlmEvent } from "./RlmTypes"
+import { CallId, type CompletionOutcome, RlmEvent } from "./RlmTypes"
 import type { RunSchedulerOptions } from "./Scheduler"
-import { runScheduler } from "./Scheduler"
+import { runScheduler, runSchedulerWithOutcome } from "./Scheduler"
 import { SandboxConfig, SandboxFactory } from "./Sandbox"
 import { SandboxBunLive } from "./SandboxBun"
 import { renderSubmitAnswer } from "./SubmitTool"
@@ -21,6 +21,7 @@ export interface CompleteOptionsBase {
   readonly query: string
   readonly context: string
   readonly contextMetadata?: ContextMetadata
+  readonly mediaAttachments?: RunSchedulerOptions["mediaAttachments"]
   readonly depth?: number
   readonly tools?: ReadonlyArray<RlmToolAny>
 }
@@ -35,6 +36,10 @@ export type CompleteOptions<A = string> = A extends string
 
 export interface RlmService {
   readonly stream: (options: CompleteOptionsBase) => Stream.Stream<RlmEvent, never>
+  readonly completeWithOutcome: {
+    (options: CompleteOptionsBase): Effect.Effect<CompletionOutcome, RlmError>
+    <A>(options: CompleteOptionsTyped<A>): Effect.Effect<CompletionOutcome, RlmError>
+  }
   readonly complete: {
     (options: CompleteOptionsBase): Effect.Effect<string, RlmError>
     <A>(options: CompleteOptionsTyped<A>): Effect.Effect<A, RlmError>
@@ -47,11 +52,32 @@ const toSchedulerOptions = (options: CompleteOptionsBase & { readonly outputSche
   ...(options.contextMetadata !== undefined
     ? { contextMetadata: options.contextMetadata }
     : {}),
+  ...(options.mediaAttachments !== undefined && options.mediaAttachments.length > 0
+    ? { mediaAttachments: options.mediaAttachments }
+    : {}),
   ...(options.depth !== undefined ? { depth: options.depth } : {}),
   ...(options.tools !== undefined && options.tools.length > 0 ? { tools: options.tools } : {}),
   ...(options.outputSchema !== undefined
     ? { outputJsonSchema: JSONSchema.make(options.outputSchema) }
     : {})
+})
+
+const toLegacyPartialError = Effect.fn("Rlm.toLegacyPartialError")(function*(
+  outcome: Extract<CompletionOutcome, { readonly _tag: "Partial" }>
+) {
+  const config = yield* RlmConfig
+  if (outcome.payload.reason === "iterations") {
+    return yield* new NoFinalAnswerError({
+      callId: CallId("root"),
+      maxIterations: config.maxIterations
+    })
+  }
+
+  return yield* new BudgetExhaustedError({
+    resource: outcome.payload.reason,
+    callId: CallId("root"),
+    remaining: 0
+  })
 })
 
 const streamInternal = (options: CompleteOptionsBase) =>
@@ -78,10 +104,56 @@ const streamInternal = (options: CompleteOptionsBase) =>
     })
   )
 
+const completeWithOutcomeInternal = Effect.fn("Rlm.completeWithOutcome")(function*(
+  options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }
+) {
+  const outcome = yield* runSchedulerWithOutcome(toSchedulerOptions(options))
+
+  if (outcome._tag === "Partial") {
+    return outcome
+  }
+
+  if (!options.outputSchema) {
+    if (outcome.payload.source === "answer") {
+      return outcome
+    }
+    return yield* new OutputValidationError({
+      message: "Plain-text completion requires `SUBMIT({ answer: \"...\" })`.",
+      raw: renderSubmitAnswer(outcome.payload)
+    })
+  }
+
+  if (outcome.payload.source !== "value") {
+    return yield* new OutputValidationError({
+      message: "Structured completion requires `SUBMIT({ value: ... })`.",
+      raw: renderSubmitAnswer(outcome.payload)
+    })
+  }
+
+  const decoded = yield* Schema.decodeUnknown(options.outputSchema)(outcome.payload.value).pipe(
+    Effect.mapError((e) => new OutputValidationError({
+      message: `Submitted final content does not match output schema: ${String(e)}`,
+      raw: renderSubmitAnswer(outcome.payload)
+    }))
+  )
+
+  return {
+    _tag: "Final" as const,
+    payload: {
+      source: "value" as const,
+      value: decoded
+    }
+  } satisfies CompletionOutcome
+})
+
 const completeInternal = Effect.fn("Rlm.complete")(function*(
   options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }
 ) {
-  const submitted = yield* runScheduler(toSchedulerOptions(options))
+  const outcome = yield* completeWithOutcomeInternal(options)
+  if (outcome._tag === "Partial") {
+    return yield* toLegacyPartialError(outcome)
+  }
+  const submitted = outcome.payload
 
   if (!options.outputSchema) {
     if (submitted.source === "answer") {
@@ -121,6 +193,8 @@ const makeRuntimeStoreLayer = () =>
 
 const makeRlmService = (makePerCallDeps: () => Layer.Layer<any, never, never>) =>
   Rlm.of({
+    completeWithOutcome: ((options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }) =>
+      completeWithOutcomeInternal(options).pipe(Effect.provide(makePerCallDeps()))) as RlmService["completeWithOutcome"],
     complete: ((options: CompleteOptionsBase & { readonly outputSchema?: Schema.Schema<any, any, never> }) =>
       completeInternal(options).pipe(Effect.provide(makePerCallDeps()))) as RlmService["complete"],
     stream: (options) =>
@@ -195,3 +269,4 @@ export const rlmBunLayer: Layer.Layer<Rlm, never, RlmModel> = Layer.effect(
 
 export const stream = streamInternal
 export const complete = completeInternal
+export const completeWithOutcome = completeWithOutcomeInternal

@@ -18,7 +18,13 @@ export interface ReplSystemPromptOptions {
   readonly budget: {
     readonly iterationsRemaining: number
     readonly llmCallsRemaining: number
+    readonly tokenBudgetRemaining?: number
+    readonly totalTokensUsed?: number
+    readonly elapsedMs?: number
+    readonly maxTimeMs?: number
   }
+  readonly namedModelNames?: ReadonlyArray<string>
+  readonly mediaNames?: ReadonlyArray<string>
   readonly tools?: ReadonlyArray<ToolDescriptor>
   readonly outputJsonSchema?: object
   readonly sandboxMode?: "permissive" | "strict"
@@ -154,6 +160,10 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   lines.push("- Only the FIRST code block in your response is executed. Do not include multiple code blocks.")
   if (canRecurse) {
     lines.push("- `print()`, `llm_query()`, `llm_query_batched()`, and all tool functions are sandbox functions. They exist ONLY inside the ```js sandbox. Call them ONLY inside ```js code blocks. Do NOT invoke them as external tool calls — the only external tool available is SUBMIT.")
+    lines.push("- `budget()` is available inside sandbox code and returns live budget fields.")
+    if (options.mediaNames !== undefined && options.mediaNames.length > 0) {
+      lines.push("- `llm_query_with_media(prompt, ...mediaNames)` is available for multimodal sub-queries.")
+    }
   }
   lines.push("")
   lines.push("## Persistent State")
@@ -259,7 +269,11 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   if (canRecurse) {
     lines.push("## Recursive Sub-calls")
     lines.push("`const result = await llm_query(query, context?)` — delegate semantic analysis to a sub-LLM. Returns a string.")
+    lines.push("`const result = await llm_query(query, context?, { model: \"name\" })` — route a sub-call to a named model.")
     lines.push("`const results = await llm_query_batched(queries, contexts?)` — run multiple independent semantic sub-calls in parallel. Returns a string array in input order.")
+    if (options.mediaNames !== undefined && options.mediaNames.length > 0) {
+      lines.push("`const result = await llm_query_with_media(prompt, ...mediaNames)` — multimodal sub-call using registered media attachments.")
+    }
     lines.push("- MUST use `await` — without it you get `[object Promise]`, not the answer.")
     lines.push("- Each call counts against your LLM call budget.")
     lines.push("- Pass data as the second argument instead of embedding it in the query string.")
@@ -267,6 +281,12 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     lines.push("- Prefer `llm_query_batched` or `Promise.all([...llm_query(...)])` for independent chunk analysis; use sequential `await` only when each step depends on the previous output.")
     if (options.subModelContextChars !== undefined) {
       lines.push(`- Sub-model context guidance: keep each llm_query context near or below ~${options.subModelContextChars} characters.`)
+    }
+    if (options.namedModelNames !== undefined && options.namedModelNames.length > 0) {
+      lines.push(`- Available named models: ${options.namedModelNames.join(", ")}`)
+    }
+    if (options.mediaNames !== undefined && options.mediaNames.length > 0) {
+      lines.push(`- Available media names: ${options.mediaNames.join(", ")}`)
     }
     lines.push("")
     lines.push("### Use llm_query() for:")
@@ -475,6 +495,12 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   lines.push(`Iteration ${options.iteration} of ${options.maxIterations}. ` +
     `Iterations remaining: ${options.budget.iterationsRemaining}. ` +
     `LLM calls remaining: ${options.budget.llmCallsRemaining}.`)
+  if (options.budget.tokenBudgetRemaining !== undefined) {
+    lines.push(`Token budget remaining: ${options.budget.tokenBudgetRemaining}. Tokens used: ${options.budget.totalTokensUsed ?? 0}.`)
+  }
+  if (options.budget.maxTimeMs !== undefined) {
+    lines.push(`Elapsed time: ${options.budget.elapsedMs ?? 0}ms / ${options.budget.maxTimeMs}ms.`)
+  }
 
   if (options.budget.iterationsRemaining <= 0) {
     lines.push("WARNING: This is your LAST iteration. If you have verified output, call SUBMIT() now.")

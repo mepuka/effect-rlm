@@ -38,14 +38,20 @@ export const recordTokens = Effect.fn("Budget.recordTokens")(function*(
   callId: CallId,
   totalTokens: number | undefined
 ) {
-  if (totalTokens === undefined) {
+  if (totalTokens === undefined || totalTokens <= 0) {
     return
   }
 
   const { budgetRef } = yield* RlmRuntime
   const allowed = yield* Ref.modify(budgetRef, (state) => {
     if (Option.isNone(state.tokenBudgetRemaining)) {
-      return [true, state] as const
+      return [
+        true,
+        new BudgetState({
+          ...state,
+          totalTokensUsed: state.totalTokensUsed + totalTokens
+        })
+      ] as const
     }
     if (state.tokenBudgetRemaining.value < totalTokens) {
       return [false, state] as const
@@ -54,7 +60,8 @@ export const recordTokens = Effect.fn("Budget.recordTokens")(function*(
       true,
       new BudgetState({
         ...state,
-        tokenBudgetRemaining: Option.some(state.tokenBudgetRemaining.value - totalTokens)
+        tokenBudgetRemaining: Option.some(state.tokenBudgetRemaining.value - totalTokens),
+        totalTokensUsed: state.totalTokensUsed + totalTokens
       })
     ] as const
   })

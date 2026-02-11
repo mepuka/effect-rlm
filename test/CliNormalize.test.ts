@@ -14,12 +14,18 @@ const baseParsed: ParsedCliConfig = {
   provider: "anthropic",
   model: "claude-sonnet-4-5-20250929",
   subModel: Option.none(),
+  namedModel: [],
+  media: [],
+  mediaUrl: [],
   subDelegationEnabled: false,
   disableSubDelegation: false,
   subDelegationDepthThreshold: Option.none(),
   maxIterations: Option.none(),
   maxDepth: Option.none(),
   maxLlmCalls: Option.none(),
+  maxTotalTokens: Option.none(),
+  maxTimeMs: Option.none(),
+  sandboxTransport: "auto",
   noPromptCaching: false,
   quiet: false,
   noColor: false,
@@ -81,6 +87,7 @@ describe("CLI normalization", () => {
       maxDepth: 4,
       maxLlmCalls: 140,
       enablePromptCaching: false,
+      sandboxTransport: "auto",
       quiet: true,
       noColor: true,
       nlpTools: false
@@ -190,5 +197,55 @@ describe("CLI normalization", () => {
         }
       )
     ).rejects.toThrow("Error: missing OPENAI_API_KEY for provider openai")
+  })
+
+  test("parses named models, media flags, and budget transport options", async () => {
+    const cliArgs = await normalize(
+      {
+        ...baseParsed,
+        namedModel: [
+          "fast=openai/gpt-4o-mini",
+          "vision=google/gemini-2.5-flash"
+        ],
+        media: [
+          "invoice=/tmp/invoice.pdf",
+          "photo=/tmp/a.png"
+        ],
+        mediaUrl: [
+          "diagram=https://example.com/diagram.png",
+          "photo=https://example.com/override.jpg"
+        ],
+        maxTotalTokens: Option.some(10_000),
+        maxTimeMs: Option.some(60_000),
+        sandboxTransport: "worker"
+      },
+      [
+        "query",
+        "--named-model",
+        "fast=openai/gpt-4o-mini",
+        "--named-model",
+        "vision=google/gemini-2.5-flash",
+        "--media",
+        "invoice=/tmp/invoice.pdf",
+        "--media-url",
+        "diagram=https://example.com/diagram.png"
+      ]
+    )
+
+    expect(cliArgs.namedModels).toEqual({
+      fast: { provider: "openai", model: "gpt-4o-mini" },
+      vision: { provider: "google", model: "gemini-2.5-flash" }
+    })
+    expect(cliArgs.maxTotalTokens).toBe(10_000)
+    expect(cliArgs.maxTimeMs).toBe(60_000)
+    expect(cliArgs.sandboxTransport).toBe("worker")
+    expect(cliArgs.media).toEqual([
+      { name: "invoice", path: "/tmp/invoice.pdf" },
+      { name: "photo", path: "/tmp/a.png" }
+    ])
+    expect(cliArgs.mediaUrls).toEqual([
+      { name: "diagram", url: "https://example.com/diagram.png" },
+      { name: "photo", url: "https://example.com/override.jpg" }
+    ])
   })
 })

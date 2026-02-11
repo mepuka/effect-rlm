@@ -4,6 +4,7 @@ import type { CallId } from "./RlmTypes"
 
 export interface SandboxConfigService {
   readonly sandboxMode: "permissive" | "strict"
+  readonly sandboxTransport: "auto" | "worker" | "spawn"
   readonly executeTimeoutMs: number
   readonly setVarTimeoutMs: number
   readonly getVarTimeoutMs: number
@@ -42,6 +43,7 @@ export class SandboxFactory extends Context.Tag("@recursive-llm/SandboxFactory")
       readonly callId: CallId
       readonly depth: number
       readonly tools?: ReadonlyArray<ToolDescriptorForSandbox>
+      readonly hasMediaAttachments?: boolean
     }) => Effect.Effect<SandboxInstance, SandboxError, Scope.Scope>
   }
 >() {}
@@ -51,6 +53,7 @@ export class SandboxConfig extends Context.Reference<SandboxConfig>()(
   {
     defaultValue: (): SandboxConfigService => ({
       sandboxMode: "permissive",
+      sandboxTransport: "auto",
       executeTimeoutMs: 300_000,
       setVarTimeoutMs: 5_000,
       getVarTimeoutMs: 5_000,

@@ -3,7 +3,7 @@ import { Schema } from "effect"
 export class BudgetExhaustedError extends Schema.TaggedError<BudgetExhaustedError>()(
   "BudgetExhaustedError",
   {
-    resource: Schema.Literal("iterations", "llmCalls", "tokens"),
+    resource: Schema.Literal("iterations", "llmCalls", "tokens", "time"),
     callId: Schema.String,
     remaining: Schema.Number
   }
@@ -55,4 +55,3 @@ export type RlmError =
   | SandboxError
   | UnknownRlmError
   | OutputValidationError
-

@@ -129,4 +129,59 @@ describe("RlmModel routing", () => {
     expect(primaryCalls.count).toBe(1)
     expect(subCalls.count).toBe(0)
   })
+
+  test("routes explicit named model selections ahead of delegation", async () => {
+    const primaryCalls = { count: 0 }
+    const subCalls = { count: 0 }
+    const fastCalls = { count: 0 }
+
+    const layer = makeRlmModelLayer({
+      primary: Effect.succeed(makeService("primary", primaryCalls)),
+      sub: Effect.succeed(makeService("sub", subCalls)),
+      named: {
+        fast: Effect.succeed(makeService("fast", fastCalls))
+      },
+      subLlmDelegation: {
+        enabled: true,
+        depthThreshold: 1
+      }
+    })
+
+    const text = await Effect.runPromise(
+      Effect.gen(function*() {
+        const model = yield* RlmModel
+        const response = yield* model.generateText({
+          prompt: "named" as any,
+          depth: 5,
+          isSubCall: true,
+          namedModel: "fast"
+        })
+        return response.text
+      }).pipe(Effect.provide(layer))
+    )
+
+    expect(text).toBe("fast")
+    expect(primaryCalls.count).toBe(0)
+    expect(subCalls.count).toBe(0)
+    expect(fastCalls.count).toBe(1)
+  })
+
+  test("fails for unknown named model keys", async () => {
+    const layer = makeRlmModelLayer({
+      primary: Effect.succeed(makeService("primary", { count: 0 }))
+    })
+
+    const result = await Effect.runPromise(
+      Effect.gen(function*() {
+        const model = yield* RlmModel
+        return yield* Effect.either(model.generateText({
+          prompt: "named" as any,
+          depth: 0,
+          namedModel: "missing"
+        }))
+      }).pipe(Effect.provide(layer))
+    )
+
+    expect(result._tag).toBe("Left")
+  })
 })

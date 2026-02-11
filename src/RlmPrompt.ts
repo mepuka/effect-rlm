@@ -1,5 +1,6 @@
 import * as Prompt from "@effect/ai/Prompt"
 import type { TranscriptEntry } from "./RlmTypes"
+import type { MediaAttachment } from "./RlmTypes"
 import { formatContextHint, type ContextMetadata } from "./ContextMetadata"
 
 export const MAX_OUTPUT_CHARS = 4_000
@@ -147,6 +148,40 @@ export const buildOneShotPrompt = (options: BuildOneShotPromptOptions): Prompt.P
     ? `${options.query}\n\nContext: ${boundedContext}`
     : options.query
   messages.push({ role: "user", content: userContent })
+  return Prompt.make(messages)
+}
+
+export interface BuildOneShotPromptWithMediaOptions {
+  readonly systemPrompt: string
+  readonly query: string
+  readonly media: ReadonlyArray<MediaAttachment>
+  readonly enablePromptCaching?: boolean
+}
+
+export const buildOneShotPromptWithMedia = (options: BuildOneShotPromptWithMediaOptions): Prompt.Prompt => {
+  const enablePromptCaching = options.enablePromptCaching ?? true
+  const messages: Array<Prompt.MessageEncoded> = []
+
+  messages.push(withPromptCacheOptions({
+    role: "system",
+    content: options.systemPrompt
+  }, enablePromptCaching))
+
+  const mediaParts = options.media.map((attachment) =>
+    Prompt.makePart("file", {
+      mediaType: attachment.mediaType,
+      data: attachment.data
+    })
+  )
+
+  messages.push({
+    role: "user",
+    content: [
+      Prompt.makePart("text", { text: options.query }),
+      ...mediaParts
+    ]
+  })
+
   return Prompt.make(messages)
 }
 

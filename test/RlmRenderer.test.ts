@@ -21,7 +21,8 @@ const makeBudget = (iters = 8, calls = 18) =>
   new BudgetState({
     iterationsRemaining: iters,
     llmCallsRemaining: calls,
-    tokenBudgetRemaining: Option.none()
+    tokenBudgetRemaining: Option.none(),
+    totalTokensUsed: 0
   })
 
 describe("RlmRenderer", () => {
@@ -53,7 +54,8 @@ describe("RlmRenderer", () => {
         budget: new BudgetState({
           iterationsRemaining: 9,
           llmCallsRemaining: 49,
-          tokenBudgetRemaining: Option.some(1000)
+          tokenBudgetRemaining: Option.some(1000),
+          totalTokensUsed: 0
         })
       }),
       { noColor: true }

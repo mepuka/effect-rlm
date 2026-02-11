@@ -36,6 +36,7 @@ export class Init extends Schema.TaggedStruct("Init", {
   callId: Schema.String,
   depth: Schema.Number,
   sandboxMode: Schema.optional(Schema.Literal("permissive", "strict")),
+  hasMediaAttachments: Schema.optional(Schema.Boolean),
   maxFrameBytes: Schema.optional(Schema.Number.pipe(
     Schema.int(),
     Schema.positive(),

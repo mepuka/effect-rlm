@@ -6,6 +6,7 @@ import { type ParsedCliConfig, normalizeCliArgs } from "./Normalize"
 import { runCliWithLayer } from "./Run"
 
 const PROVIDERS = ["anthropic", "openai", "google"] as const
+const SANDBOX_TRANSPORTS = ["auto", "worker", "spawn"] as const
 
 const query = Args.text({ name: "query" }).pipe(
   Args.withDescription("Prompt query")
@@ -64,6 +65,36 @@ const maxLlmCalls = Options.integer("max-llm-calls").pipe(
   Options.withDescription("Max total LLM calls")
 )
 
+const maxTotalTokens = Options.integer("max-total-tokens").pipe(
+  Options.optional,
+  Options.withDescription("Max total model tokens across the run")
+)
+
+const maxTimeMs = Options.integer("max-time-ms").pipe(
+  Options.optional,
+  Options.withDescription("Wall-clock budget for a run in milliseconds")
+)
+
+const sandboxTransport = Options.choice("sandbox-transport", SANDBOX_TRANSPORTS).pipe(
+  Options.withDefault("auto"),
+  Options.withDescription("Sandbox transport: auto, worker, spawn")
+)
+
+const namedModel = Options.text("named-model").pipe(
+  Options.repeated,
+  Options.withDescription("Named model mapping (repeatable): name=provider/model")
+)
+
+const media = Options.text("media").pipe(
+  Options.repeated,
+  Options.withDescription("Media attachment from local file (repeatable): name=path")
+)
+
+const mediaUrl = Options.text("media-url").pipe(
+  Options.repeated,
+  Options.withDescription("Media attachment from URL (repeatable): name=url")
+)
+
 const noPromptCaching = Options.boolean("no-prompt-caching").pipe(
   Options.withDescription("Disable Anthropic prompt caching breakpoints")
 )
@@ -102,6 +133,12 @@ const commandConfig = {
   maxIterations,
   maxDepth,
   maxLlmCalls,
+  maxTotalTokens,
+  maxTimeMs,
+  sandboxTransport,
+  namedModel,
+  media,
+  mediaUrl,
   noPromptCaching,
   quiet,
   noColor,

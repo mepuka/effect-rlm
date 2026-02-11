@@ -17,6 +17,7 @@ export interface RlmConfigService {
   readonly maxDepth: number
   readonly maxLlmCalls: number
   readonly maxTotalTokens: number | null
+  readonly maxTimeMs?: number
   readonly commandQueueCapacity?: number
   readonly concurrency: number
   readonly enableLlmQueryBatched: boolean
@@ -26,6 +27,7 @@ export interface RlmConfigService {
   readonly enablePromptCaching: boolean
   readonly primaryTarget: RlmModelTarget
   readonly subTarget?: RlmModelTarget
+  readonly namedModels?: Record<string, RlmModelTarget>
   readonly subLlmDelegation: SubLlmDelegationConfig
   readonly subModelContextChars?: number
   readonly bridgeTimeoutMs?: number
