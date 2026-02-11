@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import * as KeyValueStore from "@effect/platform/KeyValueStore"
 import { Effect, Layer, Option } from "effect"
+import { LlmCallLive } from "../src/LlmCall"
 import { RlmConfig, type RlmConfigService } from "../src/RlmConfig"
 import { RlmRuntimeLive } from "../src/Runtime"
 import { CallId } from "../src/RlmTypes"
@@ -230,15 +231,19 @@ describe("RunTraceWriter", () => {
       makeRunTraceWriter({ rootStore, varsStore })
     )
 
-    const layers = Layer.mergeAll(
+    const core = Layer.mergeAll(
       makeFakeRlmModelLayer([
         { text: "```js\nconst value = 1\n```" },
         { toolCalls: [{ name: "SUBMIT", params: { answer: "done" } }] }
       ]),
       makeFakeSandboxFactoryLayer(),
       makeRuntimeWithBridgeStoreLayer(),
-      Layer.succeed(RlmConfig, defaultConfig),
       traceLayer
+    )
+    const llmCallLayer = Layer.provideMerge(LlmCallLive, core)
+    const layers = Layer.provideMerge(
+      Layer.merge(core, llmCallLayer),
+      Layer.succeed(RlmConfig, defaultConfig)
     )
 
     const result = await Effect.runPromise(
@@ -258,6 +263,18 @@ describe("RunTraceWriter", () => {
       const lines = transcript.value.split("\n")
       expect(lines.some((line) => JSON.parse(line)._tag === "IterationStarted")).toBe(true)
       expect(lines.some((line) => JSON.parse(line)._tag === "CallFinalized")).toBe(true)
+
+      const meta = await Effect.runPromise(rootStore.get("meta.json"))
+      expect(Option.isSome(meta)).toBe(true)
+      if (Option.isSome(meta)) {
+        const metaCompletionId = JSON.parse(meta.value).completionId
+        const transcriptCompletionIds = lines
+          .filter((line) => line.trim().length > 0)
+          .map((line) => JSON.parse(line).completionId)
+        expect(transcriptCompletionIds.length).toBeGreaterThan(0)
+        expect(new Set(transcriptCompletionIds).size).toBe(1)
+        expect(transcriptCompletionIds[0]).toBe(metaCompletionId)
+      }
     }
 
     const varsSnapshot = await Effect.runPromise(

@@ -6,6 +6,7 @@ import { RunTraceWriter } from "../RunTraceWriter"
 export type SchedulerWarningCode =
   | "STALE_COMMAND_DROPPED"
   | "QUEUE_CLOSED"
+  | "QUEUE_OVERLOADED_FATAL"
   | "CALL_SCOPE_CLEANUP"
   | "MIXED_SUBMIT_AND_CODE"
   | "TOOLKIT_DEGRADED"

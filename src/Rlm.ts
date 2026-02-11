@@ -1,5 +1,6 @@
-import { Context, Effect, Layer, PubSub, Schema, Stream } from "effect"
+import { Context, Effect, Fiber, Layer, PubSub, Schema, Stream } from "effect"
 import { BridgeHandlerLive } from "./BridgeHandler"
+import { LlmCallLive } from "./LlmCall"
 import { RlmConfig } from "./RlmConfig"
 import { RlmModel } from "./RlmModel"
 import type { RlmError } from "./RlmError"
@@ -90,7 +91,7 @@ const streamInternal = (options: CompleteOptionsBase) =>
       const runtime = yield* RlmRuntime
       const events = yield* Stream.fromPubSub(runtime.events, { scoped: true })
 
-      yield* Effect.forkScoped(
+      const schedulerFiber = yield* Effect.forkScoped(
         runScheduler(toSchedulerOptions(options)).pipe(
           Effect.catchAll((error) =>
             PubSub.publish(runtime.events, RlmEvent.CallFailed({
@@ -104,7 +105,11 @@ const streamInternal = (options: CompleteOptionsBase) =>
         )
       )
 
-      return events
+      return events.pipe(
+        Stream.ensuring(
+          Fiber.interrupt(schedulerFiber).pipe(Effect.ignore)
+        )
+      )
     })
   )
 
@@ -190,10 +195,13 @@ export class Rlm extends Context.Tag("@recursive-llm/Rlm")<
 >() {}
 
 const makeRuntimeStoreLayer = () =>
-  Layer.merge(
-    RlmRuntimeLive,
-    Layer.provide(BridgeStoreLive, RlmRuntimeLive)
-  )
+  Layer.suspend(() => {
+    const runtimeLayer = RlmRuntimeLive
+    return Layer.merge(
+      runtimeLayer,
+      Layer.provide(BridgeStoreLive, runtimeLayer)
+    )
+  })
 
 const makeRlmService = (makePerCallDeps: () => Layer.Layer<any, never, never>) =>
   Rlm.of({
@@ -220,7 +228,20 @@ export const rlmLayer: Layer.Layer<Rlm, never, RlmModel | SandboxFactory> = Laye
       Layer.succeed(SandboxConfig, sandboxConfig)
     )
 
-    return makeRlmService(() => Layer.fresh(Layer.merge(makeRuntimeStoreLayer(), dependencies)))
+    return makeRlmService(() => {
+      const runtimeStoreLayer = makeRuntimeStoreLayer()
+      const llmCallLayer = Layer.provide(
+        LlmCallLive,
+        runtimeStoreLayer
+      )
+
+      return Layer.fresh(
+        Layer.provideMerge(
+          Layer.mergeAll(runtimeStoreLayer, llmCallLayer),
+          dependencies
+        )
+      )
+    })
   })
 )
 
@@ -242,6 +263,14 @@ export const rlmBunLayer: Layer.Layer<Rlm, never, RlmModel> = Layer.effect(
     // Per-call layer constructor: fresh RlmRuntime + BridgeStore → BridgeHandler → SandboxFactory
     const makePerCallDeps = () => {
       const runtimeStoreLayer = makeRuntimeStoreLayer()
+      const bridgeHandlerLayer = Layer.provide(
+        BridgeHandlerLive,
+        runtimeStoreLayer
+      )
+      const sandboxLayer = Layer.provide(
+        SandboxBunLive,
+        bridgeHandlerLayer
+      )
       const tracingLayer = traceConfig.enabled
         ? Layer.provide(
             RunTraceWriterBun({
@@ -251,20 +280,25 @@ export const rlmBunLayer: Layer.Layer<Rlm, never, RlmModel> = Layer.effect(
             runtimeStoreLayer
           )
         : RunTraceWriterNoopLayer
+      const llmCallLayer = Layer.provide(
+        LlmCallLive,
+        runtimeStoreLayer
+      )
 
       const perCallLayer = Layer.fresh(
         Layer.provideMerge(
           Layer.mergeAll(
-            SandboxBunLive,
-            tracingLayer
+            runtimeStoreLayer,
+            bridgeHandlerLayer,
+            sandboxLayer,
+            tracingLayer,
+            llmCallLayer
           ),
-          Layer.provideMerge(
-            BridgeHandlerLive,
-            runtimeStoreLayer
-          )
+          sharedLayers
         )
       )
-      return Layer.provideMerge(perCallLayer, sharedLayers)
+
+      return perCallLayer
     }
 
     return makeRlmService(makePerCallDeps)

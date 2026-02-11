@@ -1,9 +1,10 @@
-import { Clock, Context, Deferred, Duration, Effect, Exit, Layer, Option, Queue, Ref } from "effect"
+import { Clock, Context, Deferred, Duration, Effect, Layer, Option, Ref } from "effect"
 import { SandboxError } from "./RlmError"
 import { RlmConfig } from "./RlmConfig"
 import { RlmRuntime } from "./Runtime"
 import { BridgeRequestId, RlmCommand, type CallId } from "./RlmTypes"
 import { BridgeStore } from "./scheduler/BridgeStore"
+import { enqueue } from "./scheduler/Queue"
 
 export class BridgeHandler extends Context.Tag("@recursive-llm/BridgeHandler")<
   BridgeHandler,
@@ -49,24 +50,22 @@ export const BridgeHandlerLive: Layer.Layer<BridgeHandler, never, RlmRuntime | B
           yield* bridgeStore.register(bridgeRequestId, deferred)
 
           // Route through scheduler for budget enforcement.
-          // Queue.offer may fail (shutdown/interruption) or return false (dropping queue full),
-          // so capture both outcomes explicitly.
-          const offerExit = yield* Effect.exit(
-            Queue.offer(runtime.commands, RlmCommand.HandleBridgeCall({
-              callId: callerCallId,
-              bridgeRequestId,
-              method,
-              args
-            }))
+          yield* enqueue(RlmCommand.HandleBridgeCall({
+            callId: callerCallId,
+            bridgeRequestId,
+            method,
+            args
+          })).pipe(
+            Effect.provideService(RlmRuntime, runtime),
+            Effect.catchTag("SchedulerQueueError", (schedulerError) => {
+              const message = schedulerError.reason === "overloaded"
+                ? "Scheduler queue overloaded"
+                : "Scheduler queue closed"
+              return bridgeStore.fail(bridgeRequestId, new SandboxError({ message })).pipe(
+                Effect.zipRight(Effect.fail(new SandboxError({ message })))
+              )
+            })
           )
-          if (Exit.isFailure(offerExit)) {
-            yield* bridgeStore.fail(bridgeRequestId, new SandboxError({ message: "Scheduler queue closed" }))
-            return yield* new SandboxError({ message: "Scheduler queue closed" })
-          }
-          if (!offerExit.value) {
-            yield* bridgeStore.fail(bridgeRequestId, new SandboxError({ message: "Scheduler queue overloaded" }))
-            return yield* new SandboxError({ message: "Scheduler queue overloaded" })
-          }
 
           return yield* Deferred.await(deferred).pipe(
             Effect.timeoutFail({

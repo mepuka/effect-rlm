@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test"
-import { Chunk, Effect, Layer, Schema, Stream } from "effect"
+import { Chunk, Effect, Exit, Fiber, Layer, Queue, Ref, Schema, Stream } from "effect"
 import { complete, completeWithOutcome, stream } from "../src/Rlm"
+import { LlmCallLive } from "../src/LlmCall"
 import { RlmConfig, type RlmConfigService } from "../src/RlmConfig"
 import { BudgetExhaustedError, OutputValidationError } from "../src/RlmError"
-import { RlmRuntimeLive } from "../src/Runtime"
+import { RlmRuntime, RlmRuntimeLive } from "../src/Runtime"
+import { RlmCommand, CallId } from "../src/RlmTypes"
+import { SandboxFactory } from "../src/Sandbox"
 import { BridgeStoreLive } from "../src/scheduler/BridgeStore"
 import { makeFakeRlmModelLayer, type FakeModelMetrics, type FakeModelResponse } from "./helpers/FakeRlmModel"
 import { makeFakeSandboxFactoryLayer, type FakeSandboxMetrics } from "./helpers/FakeSandboxFactory"
@@ -41,7 +44,9 @@ const makeLayers = (options: {
     RlmRuntimeLive,
     Layer.provide(BridgeStoreLive, RlmRuntimeLive)
   ))
-  const base = Layer.mergeAll(model, sandbox, runtimeWithBridgeStore)
+  const core = Layer.mergeAll(model, sandbox, runtimeWithBridgeStore)
+  const llmCallLayer = Layer.provideMerge(LlmCallLive, core)
+  const base = Layer.merge(core, llmCallLayer)
   const configLayer = Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config })
   return Layer.provideMerge(base, configLayer)
 }
@@ -237,6 +242,75 @@ describe("Rlm thin slice", () => {
       expect(outcome.payload.reason).toBe("iterations")
       expect(outcome.payload.transcript.length).toBeGreaterThan(0)
     }
+  })
+
+  test("stream cancellation interrupts scheduler and cleans up runtime state", async () => {
+    const hangingSandboxLayer = Layer.succeed(
+      SandboxFactory,
+      SandboxFactory.of({
+        create: () =>
+          Effect.succeed({
+            execute: () => Effect.never,
+            setVariable: () => Effect.void,
+            getVariable: () => Effect.void,
+            listVariables: () => Effect.succeed([])
+          })
+      })
+    )
+
+    const runtimeWithBridgeStore = Layer.fresh(Layer.merge(
+      RlmRuntimeLive,
+      Layer.provide(BridgeStoreLive, RlmRuntimeLive)
+    ))
+    const core = Layer.mergeAll(
+      makeFakeRlmModelLayer([{ text: "```js\nhang()\n```" }]),
+      hangingSandboxLayer,
+      runtimeWithBridgeStore
+    )
+    const llmCallLayer = Layer.provideMerge(LlmCallLive, core)
+    const layers = Layer.provideMerge(
+      Layer.merge(core, llmCallLayer),
+      Layer.succeed(RlmConfig, defaultConfig)
+    )
+
+    const result = await Effect.runPromise(
+      Effect.gen(function*() {
+        const runtime = yield* RlmRuntime
+
+        const streamFiber = yield* stream({
+          query: "cancel me",
+          context: "ctx"
+        }).pipe(
+          Stream.runForEach(() => Effect.void),
+          Effect.fork
+        )
+
+        yield* Effect.sleep("100 millis")
+        yield* Fiber.interrupt(streamFiber)
+        const streamExit = yield* Fiber.await(streamFiber)
+
+        const statesAfter = yield* Ref.get(runtime.callStates)
+        const bridgeAfter = yield* Ref.get(runtime.bridgePending)
+        const offerAfterShutdown = yield* Effect.exit(
+          Queue.offer(runtime.commands, RlmCommand.GenerateStep({ callId: CallId("after-cancel") }))
+        )
+
+        return {
+          streamExit,
+          remainingStates: statesAfter.size,
+          remainingBridge: bridgeAfter.size,
+          offerAfterShutdown
+        }
+      }).pipe(
+        Effect.provide(layers),
+        Effect.timeout("3 seconds")
+      )
+    )
+
+    expect(Exit.isFailure(result.streamExit)).toBe(true)
+    expect(result.remainingStates).toBe(0)
+    expect(result.remainingBridge).toBe(0)
+    expect(Exit.isFailure(result.offerAfterShutdown)).toBe(true)
   })
 })
 

@@ -1,35 +1,43 @@
-import { Effect, Exit, Queue } from "effect"
-import { UnknownRlmError } from "../RlmError"
+import { Duration, Effect, Exit, Option, Queue } from "effect"
+import { SchedulerQueueError } from "../RlmError"
 import { RlmRuntime } from "../Runtime"
 import type { RlmCommand } from "../RlmTypes"
-import { publishSchedulerWarning } from "./Events"
 
 export const enqueue = Effect.fnUntraced(function*(command: RlmCommand) {
   const runtime = yield* RlmRuntime
-  const offerExit = yield* Effect.exit(Queue.offer(runtime.commands, command))
-  if (Exit.isFailure(offerExit)) {
-    return yield* new UnknownRlmError({
-      message: `Scheduler queue closed while enqueueing ${command._tag}`
-    })
-  }
-
-  if (!offerExit.value) {
-    return yield* new UnknownRlmError({
-      message: `Scheduler queue overloaded while enqueueing ${command._tag}`
-    })
-  }
-})
-
-export const enqueueOrWarn = Effect.fnUntraced(function*(command: RlmCommand) {
-  const enqueueExit = yield* Effect.exit(enqueue(command))
-  if (Exit.isFailure(enqueueExit)) {
-    yield* publishSchedulerWarning({
-      code: "QUEUE_CLOSED",
-      message: `Dropped command ${command._tag} because scheduler queue is closed or overloaded`,
+  const size = yield* Queue.size(runtime.commands)
+  if (size >= runtime.commandQueueCapacity) {
+    return yield* new SchedulerQueueError({
       callId: command.callId,
-      commandTag: command._tag
+      commandTag: command._tag,
+      reason: "overloaded"
     })
-    return false
   }
-  return true
+
+  const offerExit = yield* Effect.exit(
+    Queue.offer(runtime.commands, command).pipe(
+      Effect.timeoutOption(Duration.millis(1))
+    )
+  )
+  if (Exit.isFailure(offerExit)) {
+    return yield* new SchedulerQueueError({
+      callId: command.callId,
+      commandTag: command._tag,
+      reason: "closed"
+    })
+  }
+  if (Option.isNone(offerExit.value)) {
+    return yield* new SchedulerQueueError({
+      callId: command.callId,
+      commandTag: command._tag,
+      reason: "overloaded"
+    })
+  }
+  if (!offerExit.value.value) {
+    return yield* new SchedulerQueueError({
+      callId: command.callId,
+      commandTag: command._tag,
+      reason: "closed"
+    })
+  }
 })

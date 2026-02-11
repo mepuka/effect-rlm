@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { Effect, Layer, Queue } from "effect"
+import { Effect, Layer } from "effect"
 import { RlmConfig, type RlmConfigService } from "../src/RlmConfig"
 import { SandboxError } from "../src/RlmError"
-import { RlmRuntime, RlmRuntimeLive } from "../src/Runtime"
+import { SchedulerQueueError } from "../src/RlmError"
+import { RlmRuntimeLive } from "../src/Runtime"
 import { CallId, RlmCommand } from "../src/RlmTypes"
+import { enqueue } from "../src/scheduler/Queue"
 
 const runtimeConfig: RlmConfigService = {
   maxIterations: 10,
@@ -28,26 +30,25 @@ const runtimeConfig: RlmConfigService = {
 }
 
 describe("RlmRuntime", () => {
-  test("command queue drops offers beyond configured capacity", async () => {
+  test("command queue is bounded and enqueue fails fast on overload", async () => {
     const results = await Effect.runPromise(
       Effect.gen(function*() {
-        const runtime = yield* RlmRuntime
-
-        const first = yield* Queue.offer(runtime.commands, RlmCommand.StartCall({
+        yield* enqueue(RlmCommand.StartCall({
           callId: CallId("root"),
           depth: 0,
           query: "q",
           context: "ctx"
         }))
-        const second = yield* Queue.offer(runtime.commands, RlmCommand.GenerateStep({
+        yield* enqueue(RlmCommand.GenerateStep({
           callId: CallId("root")
         }))
-        const third = yield* Queue.offer(runtime.commands, RlmCommand.FailCall({
+
+        const third = yield* Effect.either(enqueue(RlmCommand.FailCall({
           callId: CallId("root"),
           error: new SandboxError({ message: "test" })
-        }))
+        })))
 
-        return [first, second, third] as const
+        return third
       }).pipe(
         Effect.provide(
           Layer.provide(
@@ -58,6 +59,11 @@ describe("RlmRuntime", () => {
       )
     )
 
-    expect(results).toEqual([true, true, false])
+    expect(results._tag).toBe("Left")
+    if (results._tag === "Left") {
+      expect(results.left).toBeInstanceOf(SchedulerQueueError)
+      expect(results.left.reason).toBe("overloaded")
+      expect(results.left.commandTag).toBe("FailCall")
+    }
   })
 })

@@ -115,6 +115,45 @@ describe("Rlm layer wiring", () => {
 })
 
 describe("Rlm bun layer wiring", () => {
+  test("uses one completion id per run and new id per subsequent run", async () => {
+    const result = await Effect.runPromise(
+      Effect.gen(function*() {
+        const rlm = yield* Rlm
+
+        const firstEvents = yield* rlm.stream({
+          query: "first",
+          context: "ctx"
+        }).pipe(Stream.runCollect)
+        const secondEvents = yield* rlm.stream({
+          query: "second",
+          context: "ctx"
+        }).pipe(Stream.runCollect)
+
+        const firstIds = new Set(
+          Chunk.toReadonlyArray(firstEvents).map((event) => event.completionId)
+        )
+        const secondIds = new Set(
+          Chunk.toReadonlyArray(secondEvents).map((event) => event.completionId)
+        )
+
+        return {
+          firstIds,
+          secondIds
+        }
+      }).pipe(
+        Effect.provide(
+          makeBunLayer({
+            responses: [submitAnswer("first"), submitAnswer("second")]
+          })
+        )
+      )
+    )
+
+    expect(result.firstIds.size).toBe(1)
+    expect(result.secondIds.size).toBe(1)
+    expect([...result.firstIds][0]).not.toBe([...result.secondIds][0])
+  })
+
   test("creates a fresh runtime for each complete call", async () => {
     const result = await Effect.runPromise(
       Effect.gen(function*() {

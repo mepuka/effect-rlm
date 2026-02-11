@@ -34,6 +34,9 @@ export interface RlmConfigService {
   readonly bridgeToolRetryCount?: number
   readonly bridgeLlmQueryRetryCount?: number
   readonly bridgeRetryBaseDelayMs?: number
+  readonly llmRetryCount?: number
+  readonly llmRetryBaseDelayMs?: number
+  readonly llmRetryJitter?: boolean
   readonly stallConsecutiveLimit?: number
   readonly stallResponseMaxChars?: number
 }
@@ -65,6 +68,9 @@ export class RlmConfig extends Context.Reference<RlmConfig>()(
       bridgeToolRetryCount: 1,
       bridgeLlmQueryRetryCount: 1,
       bridgeRetryBaseDelayMs: 50,
+      llmRetryCount: 1,
+      llmRetryBaseDelayMs: 100,
+      llmRetryJitter: true,
       stallConsecutiveLimit: 3,
       stallResponseMaxChars: 24
     })

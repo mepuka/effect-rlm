@@ -32,9 +32,38 @@ export class SandboxError extends Schema.TaggedError<SandboxError>()(
   }
 ) {}
 
+export class SchedulerQueueError extends Schema.TaggedError<SchedulerQueueError>()(
+  "SchedulerQueueError",
+  {
+    callId: Schema.String,
+    commandTag: Schema.Literal(
+      "StartCall",
+      "GenerateStep",
+      "ExecuteCode",
+      "CodeExecuted",
+      "HandleBridgeCall",
+      "Finalize",
+      "FailCall"
+    ),
+    reason: Schema.Literal("closed", "overloaded")
+  }
+) {}
+
 export class UnknownRlmError extends Schema.TaggedError<UnknownRlmError>()(
   "UnknownRlmError",
   {
+    message: Schema.String,
+    cause: Schema.optional(Schema.Defect)
+  }
+) {}
+
+export class ModelCallError extends Schema.TaggedError<ModelCallError>()(
+  "ModelCallError",
+  {
+    provider: Schema.Literal("anthropic", "openai", "google", "unknown"),
+    model: Schema.String,
+    operation: Schema.Literal("generateText"),
+    retryable: Schema.Boolean,
     message: Schema.String,
     cause: Schema.optional(Schema.Defect)
   }
@@ -53,5 +82,7 @@ export type RlmError =
   | NoFinalAnswerError
   | CallStateMissingError
   | SandboxError
+  | SchedulerQueueError
+  | ModelCallError
   | UnknownRlmError
   | OutputValidationError

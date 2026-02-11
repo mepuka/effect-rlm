@@ -3,7 +3,7 @@ import * as Response from "@effect/ai/Response"
 import type * as Prompt from "@effect/ai/Prompt"
 import { Effect, Layer } from "effect"
 import { RlmModel } from "../../src/RlmModel"
-import { UnknownRlmError } from "../../src/RlmError"
+import { ModelCallError } from "../../src/RlmError"
 
 export interface FakeModelMetrics {
   calls: number
@@ -17,6 +17,9 @@ export interface FakeModelMetrics {
 export interface FakeModelResponse {
   readonly text?: string
   readonly error?: string
+  readonly retryable?: boolean
+  readonly provider?: "anthropic" | "openai" | "google" | "unknown"
+  readonly model?: string
   readonly toolCalls?: ReadonlyArray<{
     readonly name: string
     readonly params: unknown
@@ -82,11 +85,24 @@ export const makeFakeRlmModelLayer = (
         index += 1
 
         if (scripted === undefined) {
-          return yield* new UnknownRlmError({ message: "Fake model script exhausted" })
+          return yield* new ModelCallError({
+            provider: "unknown",
+            model: "fake-model",
+            operation: "generateText",
+            retryable: false,
+            message: "Fake model script exhausted"
+          })
         }
 
         if (scripted.error !== undefined) {
-          return yield* new UnknownRlmError({ message: scripted.error })
+          return yield* new ModelCallError({
+            provider: scripted.provider ?? "anthropic",
+            model: scripted.model ?? "fake-model",
+            operation: "generateText",
+            retryable: scripted.retryable
+              ?? /transient|timeout|rate limit|overload|temporar/i.test(scripted.error),
+            message: scripted.error
+          })
         }
 
         return makeMinimalResponse(scripted)

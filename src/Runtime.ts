@@ -14,6 +14,7 @@ import {
 export interface RlmRuntimeShape {
   readonly completionId: string
   readonly completionStartedAtMs: number
+  readonly commandQueueCapacity: number
   readonly commands: Queue.Queue<RlmCommand>
   readonly events: PubSub.PubSub<RlmEvent>
   readonly budgetRef: Ref.Ref<BudgetState>
@@ -35,7 +36,7 @@ export const RlmRuntimeLive = Layer.scoped(
     const commandQueueCapacity = Math.max(1, config.commandQueueCapacity ?? 8_192)
 
     const commands = yield* Effect.acquireRelease(
-      Queue.dropping<RlmCommand>(commandQueueCapacity),
+      Queue.bounded<RlmCommand>(commandQueueCapacity),
       (q) => Queue.shutdown(q)
     )
     const events = yield* Effect.acquireRelease(
@@ -60,6 +61,7 @@ export const RlmRuntimeLive = Layer.scoped(
     return {
       completionId,
       completionStartedAtMs: Date.now(),
+      commandQueueCapacity,
       commands,
       events,
       budgetRef,

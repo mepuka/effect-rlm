@@ -1,5 +1,5 @@
 import { Cause, Clock, Deferred, Duration, Effect, Exit, Match, Option, Queue, Ref, Schedule, Scope, Stream } from "effect"
-import { consumeIteration, recordTokens, reserveLlmCall, snapshot, withLlmPermit } from "./Budget"
+import { consumeIteration, snapshot } from "./Budget"
 import {
   appendTranscript,
   attachExecutionOutput,
@@ -15,9 +15,10 @@ import {
 import type { CallContext } from "./CallContext"
 import { extractCodeBlock } from "./CodeExtractor"
 import { RlmConfig } from "./RlmConfig"
-import { RlmModel } from "./RlmModel"
+import { LlmCall } from "./LlmCall"
 import {
   BudgetExhaustedError,
+  SchedulerQueueError,
   NoFinalAnswerError,
   OutputValidationError,
   SandboxError,
@@ -57,7 +58,7 @@ import { makeCallVariableSpace } from "./VariableSpace"
 import { getCallStateOption, getCallStateOrWarn, deleteCallState, setCallState } from "./scheduler/CallStateStore"
 import { BridgeStore } from "./scheduler/BridgeStore"
 import { publishEvent, publishSchedulerWarning } from "./scheduler/Events"
-import { enqueue, enqueueOrWarn } from "./scheduler/Queue"
+import { enqueue } from "./scheduler/Queue"
 import { analyzeContext, type ContextMetadata } from "./ContextMetadata"
 
 import type { RlmToolAny } from "./RlmTool"
@@ -91,26 +92,22 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
   const rootDepth = options.depth ?? 0
 
   const config = yield* RlmConfig
-  const rlmModel = yield* RlmModel
+  const llmCall = yield* LlmCall
   const sandboxFactory = yield* SandboxFactory
   const sandboxConfig = yield* SandboxConfig
   const bridgeStore = yield* BridgeStore
   const traceWriter = yield* RunTraceWriter
   const bridgeRetryBaseDelayMs = config.bridgeRetryBaseDelayMs ?? 50
   const bridgeToolRetryCount = config.bridgeToolRetryCount ?? 1
-  const bridgeLlmQueryRetryCount = config.bridgeLlmQueryRetryCount ?? 1
 
   const bridgeToolRetryPolicy = Schedule.exponential(Duration.millis(bridgeRetryBaseDelayMs)).pipe(
     Schedule.compose(Schedule.recurs(bridgeToolRetryCount))
-  )
-
-  const bridgeLlmQueryRetryPolicy = Schedule.exponential(Duration.millis(bridgeRetryBaseDelayMs)).pipe(
-    Schedule.compose(Schedule.recurs(bridgeLlmQueryRetryCount))
   )
   const stallConsecutiveLimit = Math.max(1, config.stallConsecutiveLimit ?? 3)
   const stallResponseMaxChars = Math.max(0, config.stallResponseMaxChars ?? 24)
 
   const resultDeferred = yield* Deferred.make<CompletionOutcome, RlmError>()
+  const queueFailureHandled = yield* Ref.make(false)
 
   const rememberPartialOutcome = (callId: CallId, partial: PartialResult) =>
     Ref.update(runtime.partialOutcomesRef, (current) =>
@@ -130,6 +127,50 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
 
   const failBridgeDeferred = (bridgeRequestId: BridgeRequestId, error: unknown) =>
     bridgeStore.fail(bridgeRequestId, error).pipe(Effect.asVoid)
+
+  const closeRemainingCallScopes = (exit: Exit.Exit<unknown, unknown>) =>
+    Effect.gen(function*() {
+      const remainingStates = yield* Ref.getAndSet(runtime.callStates, new Map())
+      if (remainingStates.size === 0) return
+
+      yield* Effect.forEach([...remainingStates.values()], (state) =>
+        Effect.gen(function*() {
+          yield* publishSchedulerWarning({
+            code: "CALL_SCOPE_CLEANUP",
+            message: `Closing leaked call scope for ${state.callId} during scheduler shutdown`,
+            callId: state.callId
+          })
+          yield* Scope.close(state.callScope, exit).pipe(Effect.ignore)
+        }),
+        { discard: true }
+      )
+    })
+
+  const failRemainingBridgeDeferreds = () =>
+    bridgeStore.failAll("Scheduler stopped before bridge response")
+
+  const handleFatalQueueFailure = (error: SchedulerQueueError) =>
+    Effect.gen(function*() {
+      const alreadyHandled = yield* Ref.modify(queueFailureHandled, (handled) => [handled, true] as const)
+      if (alreadyHandled) return
+
+      yield* publishSchedulerWarning({
+        code: "QUEUE_OVERLOADED_FATAL",
+        message: `Scheduler command queue ${error.reason} while enqueueing ${error.commandTag}; terminating run.`,
+        callId: error.callId as CallId,
+        commandTag: error.commandTag
+      })
+      yield* publishEvent(RlmEvent.CallFailed({
+        completionId: runtime.completionId,
+        callId: rootCallId,
+        depth: rootDepth,
+        error
+      }))
+      yield* failRemainingBridgeDeferreds()
+      yield* closeRemainingCallScopes(Exit.fail(error))
+      yield* Deferred.fail(resultDeferred, error).pipe(Effect.ignore)
+      yield* Queue.shutdown(runtime.commands).pipe(Effect.ignore)
+    })
 
   const budgetSnapshotForSandbox = Effect.gen(function*() {
     const budget = yield* snapshot
@@ -242,14 +283,6 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
     commandTag: RlmCommand["_tag"]
   ) =>
     Effect.gen(function*() {
-      const reserveExit = yield* Effect.exit(reserveLlmCall(callState.callId))
-      if (Exit.isFailure(reserveExit)) {
-        return {
-          _tag: "Partial",
-          payload: yield* capturePartialResult(callState, reason)
-        } satisfies CompletionOutcome
-      }
-
       const transcript = yield* readTranscript(callState)
       const extractPrompt = buildExtractPrompt({
         systemPrompt: buildExtractSystemPrompt(callState.outputJsonSchema),
@@ -263,16 +296,15 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
 
       const extractOutputMode = callState.outputJsonSchema !== undefined ? "structured" as const : "plain" as const
       const extractToolkit = buildSubmitToolkit(extractOutputMode)
-      const response = yield* withLlmPermit(
-        rlmModel.generateText({
-          prompt: extractPrompt,
-          depth: callState.depth,
-          isSubCall: callState.parentBridgeRequestId !== undefined,
-          toolkit: extractToolkit,
-          toolChoice: { tool: SUBMIT_TOOL_NAME },
-          disableToolCallResolution: true
-        })
-      ).pipe(
+      const response = yield* llmCall.generateText({
+        callId: callState.callId,
+        prompt: extractPrompt,
+        depth: callState.depth,
+        isSubCall: callState.parentBridgeRequestId !== undefined,
+        toolkit: extractToolkit,
+        toolChoice: { tool: SUBMIT_TOOL_NAME },
+        disableToolCallResolution: true
+      }).pipe(
         Effect.catchAll((error) =>
           Effect.gen(function*() {
             yield* publishSchedulerWarning({
@@ -281,27 +313,17 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
               callId: callState.callId,
               commandTag
             })
-            const fallbackReserveExit = yield* Effect.exit(reserveLlmCall(callState.callId))
-            if (Exit.isFailure(fallbackReserveExit)) {
-              return yield* new BudgetExhaustedError({
-                resource: "llmCalls",
-                callId: callState.callId,
-                remaining: 0
-              })
-            }
-            return yield* withLlmPermit(
-              rlmModel.generateText({
-                prompt: extractPrompt,
-                depth: callState.depth,
-                isSubCall: callState.parentBridgeRequestId !== undefined,
-                toolChoice: "none"
-              })
-            )
+            return yield* llmCall.generateText({
+              callId: callState.callId,
+              prompt: extractPrompt,
+              depth: callState.depth,
+              isSubCall: callState.parentBridgeRequestId !== undefined,
+              toolChoice: "none"
+            })
           })
         )
       )
 
-      yield* recordTokens(callState.callId, response.usage.totalTokens)
       yield* publishEvent(RlmEvent.ModelResponse({
         completionId: runtime.completionId,
         callId: callState.callId,
@@ -453,10 +475,11 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
           )
         }
 
-        yield* enqueueOrWarn(RlmCommand.GenerateStep({
+        yield* enqueue(RlmCommand.GenerateStep({
           callId: command.callId
         }))
       }).pipe(
+        Effect.catchTag("SchedulerQueueError", (error) => Effect.fail(error)),
         Effect.catchAll((error) =>
           Effect.gen(function*() {
             // Close scope directly — CallState was never stored so handleFailCall can't.
@@ -466,7 +489,7 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
             if (command.parentBridgeRequestId) {
               yield* failBridgeDeferred(command.parentBridgeRequestId, error)
             }
-            yield* enqueueOrWarn(RlmCommand.FailCall({
+            yield* enqueue(RlmCommand.FailCall({
               callId: command.callId,
               error: new UnknownRlmError({ message: "StartCall failed", cause: error })
             }))
@@ -519,8 +542,6 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         iteration: iteration + 1,
         budget
       }))
-
-      yield* reserveLlmCall(callState.callId)
 
       const toolDescriptors = callState.tools?.map((t) => ({
         name: t.name,
@@ -588,16 +609,15 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         || ((yield* hasCodeExecuted(callState)) && currentIteration >= 3)
 
       const response = submitReady
-        ? yield* withLlmPermit(
-            rlmModel.generateText({
-              prompt,
-              depth: callState.depth,
-              isSubCall,
-              toolkit: buildSubmitToolkit(outputMode),
-              toolChoice: "auto",
-              disableToolCallResolution: true
-            })
-          ).pipe(
+        ? yield* llmCall.generateText({
+            callId: callState.callId,
+            prompt,
+            depth: callState.depth,
+            isSubCall,
+            toolkit: buildSubmitToolkit(outputMode),
+            toolChoice: "auto",
+            disableToolCallResolution: true
+          }).pipe(
             Effect.catchAll((error) =>
               Effect.gen(function*() {
                 yield* publishSchedulerWarning({
@@ -606,27 +626,22 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
                   callId: callState.callId,
                   commandTag: command._tag
                 })
-                yield* reserveLlmCall(callState.callId)
-                return yield* withLlmPermit(
-                  rlmModel.generateText({
-                    prompt,
-                    depth: callState.depth,
-                    isSubCall,
-                    toolChoice: "none"
-                  })
-                )
+                return yield* llmCall.generateText({
+                  callId: callState.callId,
+                  prompt,
+                  depth: callState.depth,
+                  isSubCall,
+                  toolChoice: "none"
+                })
               })
             )
           )
-        : yield* withLlmPermit(
-            rlmModel.generateText({
-              prompt,
-              depth: callState.depth,
-              isSubCall
-            })
-          )
-
-      yield* recordTokens(callState.callId, response.usage.totalTokens)
+        : yield* llmCall.generateText({
+            callId: callState.callId,
+            prompt,
+            depth: callState.depth,
+            isSubCall
+          })
 
       const modelEvent = RlmEvent.ModelResponse({
         completionId: runtime.completionId,
@@ -682,14 +697,14 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
                 `\u2717 SUBMIT rejected: ${error.message}\nFix your __vars assignment with code first, then call SUBMIT. Do NOT retry SUBMIT immediately — write a \`\`\`js code block to fix the issue.`
               )
               yield* incrementIteration(callState)
-              yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: callState.callId }))
+              yield* enqueue(RlmCommand.GenerateStep({ callId: callState.callId }))
               return undefined
             })
           )
         )
         if (resolvedSubmit === undefined) return
 
-        yield* enqueueOrWarn(RlmCommand.Finalize({
+        yield* enqueue(RlmCommand.Finalize({
           callId: callState.callId,
           payload: resolvedSubmit
         }))
@@ -708,7 +723,7 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
           `\u2717 SUBMIT rejected: ${submitAnswer.message}\nYou have not completed the task yet. Continue working by writing a \`\`\`js code block. Only call SUBMIT after you have finished and verified your results.`
         )
         yield* incrementIteration(callState)
-        yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: callState.callId }))
+        yield* enqueue(RlmCommand.GenerateStep({ callId: callState.callId }))
         return
       }
 
@@ -717,7 +732,7 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         yield* resetConsecutiveStalls(callState)
         yield* appendTranscript(callState, response.text)
         yield* incrementIteration(callState)
-        yield* enqueueOrWarn(RlmCommand.ExecuteCode({ callId: callState.callId, code }))
+        yield* enqueue(RlmCommand.ExecuteCode({ callId: callState.callId, code }))
         return
       }
 
@@ -748,13 +763,13 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         })
       }
 
-      yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: callState.callId }))
+      yield* enqueue(RlmCommand.GenerateStep({ callId: callState.callId }))
     }).pipe(
       Effect.catchTag("BudgetExhaustedError", (err) =>
         Effect.gen(function*() {
           const callStateOption = yield* getCallStateOption(command.callId)
           if (Option.isNone(callStateOption)) {
-            return yield* enqueueOrWarn(RlmCommand.FailCall({
+            return yield* enqueue(RlmCommand.FailCall({
               callId: command.callId,
               error: err.resource === "iterations"
                 ? new NoFinalAnswerError({ callId: command.callId, maxIterations: config.maxIterations })
@@ -765,7 +780,7 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
 
           const fallbackOutcome = yield* attemptExtractFallback(callState, err.resource, command._tag)
           if (fallbackOutcome._tag === "Final") {
-            yield* enqueueOrWarn(RlmCommand.Finalize({
+            yield* enqueue(RlmCommand.Finalize({
               callId: callState.callId,
               payload: fallbackOutcome.payload
             }))
@@ -780,14 +795,21 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
                 callId: command.callId,
                 remaining: 0
               })
-          yield* enqueueOrWarn(RlmCommand.FailCall({
+          yield* enqueue(RlmCommand.FailCall({
             callId: command.callId,
             error: mappedError
           }))
         })
       ),
+      Effect.catchTag("ModelCallError", (error) =>
+        enqueue(RlmCommand.FailCall({
+          callId: command.callId,
+          error
+        }))
+      ),
+      Effect.catchTag("SchedulerQueueError", (error) => Effect.fail(error)),
       Effect.catchAll((error) =>
-        enqueueOrWarn(RlmCommand.FailCall({
+        enqueue(RlmCommand.FailCall({
           callId: command.callId,
           error: new UnknownRlmError({ message: "GenerateStep failed", cause: error })
         }))
@@ -816,13 +838,16 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
       yield* Effect.forkIn(
         callState.sandbox.execute(command.code).pipe(
           Effect.flatMap((output) =>
-            enqueueOrWarn(RlmCommand.CodeExecuted({ callId: command.callId, output }))
+            enqueue(RlmCommand.CodeExecuted({ callId: command.callId, output }))
           ),
           Effect.catchAll((error) =>
-            enqueueOrWarn(RlmCommand.CodeExecuted({
+            enqueue(RlmCommand.CodeExecuted({
               callId: command.callId,
               output: `Error: ${formatExecutionError(error)}`
             }))
+          ),
+          Effect.catchTag("SchedulerQueueError", (error) =>
+            handleFatalQueueFailure(error)
           )
         ),
         callState.callScope
@@ -897,7 +922,7 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         )
       )
 
-      yield* enqueueOrWarn(RlmCommand.GenerateStep({ callId: command.callId }))
+      yield* enqueue(RlmCommand.GenerateStep({ callId: command.callId }))
     })
 
   // --- handleHandleBridgeCall ---
@@ -931,24 +956,19 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
                 enablePromptCaching: config.enablePromptCaching
               })
 
-          yield* reserveLlmCall(command.callId)
-          const response = yield* withLlmPermit(
-            rlmModel.generateText({
-              prompt: oneShotPrompt,
-              depth: options.depth,
-              isSubCall: true,
-              ...(options.namedModel !== undefined ? { namedModel: options.namedModel } : {})
-            })
-          )
-          yield* recordTokens(command.callId, response.usage.totalTokens)
+          const response = yield* llmCall.generateText({
+            callId: command.callId,
+            prompt: oneShotPrompt,
+            depth: options.depth,
+            isSubCall: true,
+            ...(options.namedModel !== undefined ? { namedModel: options.namedModel } : {})
+          })
 
           if (options.responseFormat !== undefined) {
             return parseAndValidateJson(response.text, options.responseFormat.schema)
           }
           return response.text
-        }).pipe(
-          Effect.retry(bridgeLlmQueryRetryPolicy)
-        )
+        })
 
       // Guard: call state may be deleted if call already finalized
       const callStateOption = yield* getCallStateOption(command.callId)
@@ -1243,19 +1263,14 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
       } else {
         // Below max depth: start recursive sub-call through scheduler
         const subCallId = CallId(`${command.callId}-bridge-${command.bridgeRequestId}`)
-        const enqueueExit = yield* Effect.exit(
-          enqueue(RlmCommand.StartCall({
-            callId: subCallId,
-            depth: callState.depth + 1,
-            query: llmQueryArg,
-            context: llmContextArg ?? "",
-            parentBridgeRequestId: command.bridgeRequestId,
-            ...(responseFormat !== undefined ? { outputJsonSchema: responseFormat.schema } : {})
-          }))
-        )
-        if (Exit.isFailure(enqueueExit)) {
-          yield* failBridgeDeferred(command.bridgeRequestId, "Scheduler shutting down")
-        }
+        yield* enqueue(RlmCommand.StartCall({
+          callId: subCallId,
+          depth: callState.depth + 1,
+          query: llmQueryArg,
+          context: llmContextArg ?? "",
+          parentBridgeRequestId: command.bridgeRequestId,
+          ...(responseFormat !== undefined ? { outputJsonSchema: responseFormat.schema } : {})
+        }))
       }
     })
 
@@ -1385,27 +1400,6 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
     })
   )
 
-  const closeRemainingCallScopes = (exit: Exit.Exit<unknown, unknown>) =>
-    Effect.gen(function*() {
-      const remainingStates = yield* Ref.getAndSet(runtime.callStates, new Map())
-      if (remainingStates.size === 0) return
-
-      yield* Effect.forEach([...remainingStates.values()], (state) =>
-        Effect.gen(function*() {
-          yield* publishSchedulerWarning({
-            code: "CALL_SCOPE_CLEANUP",
-            message: `Closing leaked call scope for ${state.callId} during scheduler shutdown`,
-            callId: state.callId
-          })
-          yield* Scope.close(state.callScope, exit).pipe(Effect.ignore)
-        }),
-        { discard: true }
-      )
-    })
-
-  const failRemainingBridgeDeferreds = () =>
-    bridgeStore.failAll("Scheduler stopped before bridge response")
-
   const runLoop = Effect.gen(function*() {
     yield* enqueue(RlmCommand.StartCall({
       callId: rootCallId,
@@ -1427,11 +1421,8 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
     yield* Stream.fromQueue(runtime.commands).pipe(
       Stream.runForEach((command) =>
         processCommand(command).pipe(
-          Effect.catchAllCause((cause) =>
-            enqueueOrWarn(RlmCommand.FailCall({
-              callId: command.callId,
-              error: new UnknownRlmError({ message: "Unexpected scheduler failure", cause })
-            }))
+          Effect.catchTag("SchedulerQueueError", (error) =>
+            handleFatalQueueFailure(error)
           )
         )
       )
@@ -1441,6 +1432,12 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
   })
 
   return yield* runLoop.pipe(
+    Effect.catchTag("SchedulerQueueError", (error) =>
+      Effect.gen(function*() {
+        yield* handleFatalQueueFailure(error)
+        return yield* Deferred.await(resultDeferred)
+      })
+    ),
     Effect.onExit((exit) =>
       Effect.gen(function*() {
         yield* Queue.shutdown(runtime.commands).pipe(Effect.ignore)

@@ -163,6 +163,7 @@ export type RlmEvent = Data.TaggedEnum<{
       | "STALL_DETECTED_EARLY_EXTRACT"
       | "SUBMIT_INVALID"
       | "SUBMIT_RESOLVE_FAILED"
+      | "QUEUE_OVERLOADED_FATAL"
     readonly message: string
     readonly callId?: CallId
     readonly commandTag?: RlmCommand["_tag"]

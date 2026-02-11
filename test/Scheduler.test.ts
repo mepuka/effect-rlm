@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test"
 import { Chunk, Deferred, Effect, Exit, Layer, Option, PubSub, Queue, Ref, Schema, Stream } from "effect"
 import { complete, stream } from "../src/Rlm"
+import { LlmCallLive } from "../src/LlmCall"
 import { RlmConfig, type RlmConfigService } from "../src/RlmConfig"
-import { SandboxError } from "../src/RlmError"
+import { BudgetExhaustedError, ModelCallError, SandboxError, SchedulerQueueError } from "../src/RlmError"
 import { SandboxFactory } from "../src/Sandbox"
 import { SandboxBunLive } from "../src/SandboxBun"
 import { BridgeHandlerLive } from "../src/BridgeHandler"
@@ -54,7 +55,9 @@ const makeLayers = (options: {
   const model = makeFakeRlmModelLayer(options.responses, options.modelMetrics)
   const sandbox = makeFakeSandboxFactoryLayer(options.sandboxMetrics)
   const runtimeLayer = makeRuntimeWithBridgeStoreLayer()
-  const base = Layer.mergeAll(model, sandbox, runtimeLayer)
+  const core = Layer.mergeAll(model, sandbox, runtimeLayer)
+  const llmCallLayer = Layer.provideMerge(LlmCallLive, core)
+  const base = Layer.merge(core, llmCallLayer)
   const configLayer = Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config })
   return Layer.provideMerge(base, configLayer)
 }
@@ -181,10 +184,13 @@ describe("Scheduler integration", () => {
       })
     )
 
-    const layers = Layer.mergeAll(
+    const core = Layer.mergeAll(
       model,
       failingSyncSandboxLayer,
-      makeRuntimeWithBridgeStoreLayer(),
+      makeRuntimeWithBridgeStoreLayer()
+    )
+    const layers = Layer.provideMerge(
+      Layer.merge(core, Layer.provideMerge(LlmCallLive, core)),
       Layer.succeed(RlmConfig, defaultConfig)
     )
 
@@ -890,6 +896,135 @@ describe("Scheduler integration", () => {
     expect(result._tag).toBe("Left")
   })
 
+  test("retryable model failures retry once and then succeed", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: []
+    }
+
+    const result = await Effect.runPromise(
+      complete({
+        query: "retry model call",
+        context: "x".repeat(400)
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              {
+                error: "transient upstream timeout",
+                retryable: true,
+                provider: "anthropic",
+                model: "fake-model"
+              },
+              submitAnswer("recovered")
+            ],
+            modelMetrics,
+            config: {
+              llmRetryCount: 1,
+              llmRetryBaseDelayMs: 1,
+              llmRetryJitter: false,
+              maxLlmCalls: 2
+            }
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Right")
+    if (result._tag === "Right") {
+      expect(result.right).toBe("recovered")
+    }
+    expect(modelMetrics.calls).toBe(2)
+  })
+
+  test("non-retryable model failures do not retry", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: []
+    }
+
+    const result = await Effect.runPromise(
+      complete({
+        query: "no retry",
+        context: "x".repeat(400)
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              {
+                error: "invalid request payload",
+                retryable: false,
+                provider: "anthropic",
+                model: "fake-model"
+              }
+            ],
+            modelMetrics,
+            config: {
+              llmRetryCount: 3,
+              llmRetryBaseDelayMs: 1,
+              llmRetryJitter: false,
+              maxLlmCalls: 5
+            }
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") {
+      expect(result.left).toBeInstanceOf(ModelCallError)
+      expect((result.left as ModelCallError).retryable).toBe(false)
+    }
+    expect(modelMetrics.calls).toBe(1)
+  })
+
+  test("retry attempts consume llm call budget per attempt", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: []
+    }
+
+    const result = await Effect.runPromise(
+      complete({
+        query: "budgeted retry",
+        context: "x".repeat(400)
+      }).pipe(
+        Effect.either,
+        Effect.provide(
+          makeLayers({
+            responses: [
+              {
+                error: "transient overloaded upstream",
+                retryable: true,
+                provider: "anthropic",
+                model: "fake-model"
+              },
+              submitAnswer("should-not-run")
+            ],
+            modelMetrics,
+            config: {
+              llmRetryCount: 1,
+              llmRetryBaseDelayMs: 1,
+              llmRetryJitter: false,
+              maxLlmCalls: 1
+            }
+          })
+        )
+      )
+    )
+
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") {
+      expect(result.left).toBeInstanceOf(BudgetExhaustedError)
+    }
+    expect(modelMetrics.calls).toBe(1)
+  })
+
   test("drops stale commands and emits SchedulerWarning without failing root run", async () => {
     const result = await Effect.runPromise(
       Effect.scoped(
@@ -928,6 +1063,70 @@ describe("Scheduler integration", () => {
     expect(staleWarning).toBeDefined()
   })
 
+  test("queue overload fails root call fast and emits terminal overload warning", async () => {
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function*() {
+          const runtime = yield* RlmRuntime
+          const subscription = yield* PubSub.subscribe(runtime.events)
+
+          // Fill the single-slot queue before scheduler startup.
+          yield* Queue.offer(runtime.commands, RlmCommand.GenerateStep({
+            callId: CallId("prefilled")
+          }))
+
+          const schedulerResult = yield* runScheduler({
+            query: "queue overload",
+            context: "ctx"
+          }).pipe(
+            Effect.either,
+            Effect.timeout("2 seconds")
+          )
+
+          const events = Chunk.toReadonlyArray(yield* subscription.takeAll)
+          const offerAfterShutdown = yield* Effect.exit(
+            Queue.offer(runtime.commands, RlmCommand.GenerateStep({ callId: CallId("after-shutdown") }))
+          )
+
+          return {
+            schedulerResult,
+            events,
+            offerAfterShutdown
+          }
+        }).pipe(
+          Effect.provide(
+            makeLayers({
+              responses: [submitAnswer("unreachable")],
+              config: {
+                commandQueueCapacity: 1
+              }
+            })
+          )
+        )
+      )
+    )
+
+    expect(result.schedulerResult._tag).toBe("Left")
+    if (result.schedulerResult._tag === "Left") {
+      expect(result.schedulerResult.left).toBeInstanceOf(SchedulerQueueError)
+      if (result.schedulerResult.left instanceof SchedulerQueueError) {
+        expect(result.schedulerResult.left.reason).toBe("overloaded")
+        expect(result.schedulerResult.left.commandTag).toBe("StartCall")
+      }
+    }
+
+    const overloadWarnings = result.events.filter((event) =>
+      event._tag === "SchedulerWarning" && event.code === "QUEUE_OVERLOADED_FATAL"
+    )
+    expect(overloadWarnings.length).toBe(1)
+
+    const rootFailed = result.events.find((event) =>
+      event._tag === "CallFailed" && event.callId === CallId("root")
+    )
+    expect(rootFailed).toBeDefined()
+    expect(Exit.isFailure(result.offerAfterShutdown)).toBe(true)
+  })
+
   test("scheduler interruption closes call scopes, bridge pending state, and command queue", async () => {
     const hangingSandboxLayer = Layer.succeed(
       SandboxFactory,
@@ -942,10 +1141,14 @@ describe("Scheduler integration", () => {
       })
     )
 
-    const layers = Layer.mergeAll(
+    const core = Layer.mergeAll(
       makeFakeRlmModelLayer([{ text: "```js\nprint('hanging')\n```" }]),
       hangingSandboxLayer,
       makeRuntimeWithBridgeStoreLayer()
+    )
+    const layers = Layer.provideMerge(
+      Layer.merge(core, Layer.provideMerge(LlmCallLive, core)),
+      Layer.succeed(RlmConfig, defaultConfig)
     )
 
     const result = await Effect.runPromise(
@@ -1009,7 +1212,11 @@ describe("Scheduler integration", () => {
       submitAnswer("recovered")
     ], modelMetrics)
 
-    const layers = Layer.mergeAll(model, failOnceSandboxLayer, makeRuntimeWithBridgeStoreLayer())
+    const core = Layer.mergeAll(model, failOnceSandboxLayer, makeRuntimeWithBridgeStoreLayer())
+    const layers = Layer.provideMerge(
+      Layer.merge(core, Layer.provideMerge(LlmCallLive, core)),
+      Layer.succeed(RlmConfig, defaultConfig)
+    )
 
     const result = await Effect.runPromise(
       complete({ query: "compute", context: "ctx" }).pipe(
@@ -1036,8 +1243,9 @@ describe("Scheduler integration", () => {
       submitAnswer("extracted")
     ])
 
-    const layers = Layer.provide(
-      Layer.mergeAll(model, alwaysFailSandboxLayer, makeRuntimeWithBridgeStoreLayer()),
+    const core = Layer.mergeAll(model, alwaysFailSandboxLayer, makeRuntimeWithBridgeStoreLayer())
+    const layers = Layer.provideMerge(
+      Layer.merge(core, Layer.provideMerge(LlmCallLive, core)),
       Layer.succeed(RlmConfig, { ...defaultConfig, maxIterations: 2 })
     )
 
@@ -1071,7 +1279,11 @@ describe("Scheduler integration", () => {
       submitAnswer("ok")
     ], modelMetrics)
 
-    const layers = Layer.mergeAll(model, failOnceSandboxLayer, makeRuntimeWithBridgeStoreLayer())
+    const core = Layer.mergeAll(model, failOnceSandboxLayer, makeRuntimeWithBridgeStoreLayer())
+    const layers = Layer.provideMerge(
+      Layer.merge(core, Layer.provideMerge(LlmCallLive, core)),
+      Layer.succeed(RlmConfig, defaultConfig)
+    )
 
     await Effect.runPromise(
       complete({ query: "compute", context: "ctx" }).pipe(
@@ -1104,7 +1316,11 @@ describe("Scheduler integration", () => {
       submitAnswer("ok")
     ])
 
-    const layers = Layer.mergeAll(model, failOnceSandboxLayer, makeRuntimeWithBridgeStoreLayer())
+    const core = Layer.mergeAll(model, failOnceSandboxLayer, makeRuntimeWithBridgeStoreLayer())
+    const layers = Layer.provideMerge(
+      Layer.merge(core, Layer.provideMerge(LlmCallLive, core)),
+      Layer.succeed(RlmConfig, defaultConfig)
+    )
 
     const events = await Effect.runPromise(
       stream({ query: "compute", context: "ctx" }).pipe(
@@ -1156,7 +1372,11 @@ describe("Scheduler integration", () => {
       submitAnswer("ok")
     ], modelMetrics)
 
-    const layers = Layer.mergeAll(model, primitiveFailOnceSandboxLayer, makeRuntimeWithBridgeStoreLayer())
+    const core = Layer.mergeAll(model, primitiveFailOnceSandboxLayer, makeRuntimeWithBridgeStoreLayer())
+    const layers = Layer.provideMerge(
+      Layer.merge(core, Layer.provideMerge(LlmCallLive, core)),
+      Layer.succeed(RlmConfig, defaultConfig)
+    )
 
     const result = await Effect.runPromise(
       complete({ query: "compute", context: "ctx" }).pipe(
@@ -1197,7 +1417,11 @@ describe("Scheduler integration", () => {
     )
 
     const runtimeLayer = makeRuntimeWithBridgeStoreLayer()
-    const layers = Layer.mergeAll(model, failingSandboxLayer, runtimeLayer)
+    const core = Layer.mergeAll(model, failingSandboxLayer, runtimeLayer)
+    const layers = Layer.provideMerge(
+      Layer.merge(core, Layer.provideMerge(LlmCallLive, core)),
+      Layer.succeed(RlmConfig, defaultConfig)
+    )
 
     const result = await Effect.runPromise(
       complete({
@@ -1224,14 +1448,28 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     readonly config?: Partial<RlmConfigService>
   }) => {
     const model = makeFakeRlmModelLayer(options.responses, options.modelMetrics)
-    // Mirror rlmBunLayer composition: fresh RlmRuntime + BridgeStore → BridgeHandler → SandboxBunLive
+    const runtimeLayer = runtimeWithBridgeStoreLayer
+    const bridgeHandlerLayer = Layer.provideMerge(
+      BridgeHandlerLive,
+      runtimeLayer
+    )
+    const llmCallLayer = Layer.provideMerge(
+      LlmCallLive,
+      runtimeLayer
+    )
     const perCallLayer = Layer.fresh(
       Layer.provideMerge(
-        SandboxBunLive,
-        Layer.provideMerge(BridgeHandlerLive, runtimeWithBridgeStoreLayer)
+        Layer.mergeAll(
+          SandboxBunLive,
+          llmCallLayer
+        ),
+        bridgeHandlerLayer
       )
     )
-    const base = Layer.mergeAll(model, perCallLayer)
+    const base = Layer.merge(
+      model,
+      Layer.provideMerge(perCallLayer, model)
+    )
     const configLayer = Layer.succeed(RlmConfig, { ...defaultConfig, ...options.config })
     return Layer.provideMerge(base, configLayer)
   }
