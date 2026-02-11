@@ -8,7 +8,8 @@
     "typecheck": "tsc --noEmit",
     "rlm": "bun run src/cli.ts",
     "test": "bun test",
-    "test:property": "bun test test/property"
+    "test:property": "bun test test/property",
+    "bench:transport": "bun run scripts/bench/sandbox-transport.ts"
   },
   "devDependencies": {
     "@effect/language-service": "^0.73.0",

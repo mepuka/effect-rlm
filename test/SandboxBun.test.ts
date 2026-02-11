@@ -19,6 +19,7 @@ const makeBridgeHandlerLayer = (
 
 const testConfig: SandboxConfig["Type"] = {
   sandboxMode: "permissive",
+  sandboxTransport: "auto",
   executeTimeoutMs: 10_000,
   setVarTimeoutMs: 5_000,
   getVarTimeoutMs: 5_000,
@@ -42,6 +43,31 @@ const makeTestLayer = (
   }
   return Layer.provide(sandboxLayer, Layer.succeed(SandboxConfig, testConfig))
 }
+
+const runTimeoutCloseCanary = (transport: "auto" | "worker", iterations = 8) =>
+  Effect.gen(function*() {
+    const startedAt = Date.now()
+    const factory = yield* SandboxFactory
+
+    for (let index = 0; index < iterations; index += 1) {
+      const scope = yield* Scope.make()
+      const sandbox = yield* factory.create({ callId: `canary-${transport}-${index}` as CallId, depth: 0 }).pipe(
+        Effect.provideService(Scope.Scope, scope)
+      )
+
+      const pending = yield* Effect.fork(
+        sandbox.execute("await new Promise(() => {})").pipe(Effect.either)
+      )
+
+      yield* Effect.sleep(Duration.millis(5))
+      yield* Scope.close(scope, Exit.void)
+
+      const result = yield* Fiber.join(pending)
+      expect(result._tag).toBe("Left")
+    }
+
+    return Date.now() - startedAt
+  })
 
 describe("SandboxBun", () => {
   test("execute returns code output", async () => {
@@ -251,6 +277,38 @@ describe("SandboxBun", () => {
     expect(report.envKeys).toEqual([])
   })
 
+  test("transport canary: auto mode closes timed-out executions promptly", async () => {
+    const elapsed = await Effect.runPromise(
+      runTimeoutCloseCanary("auto").pipe(
+        Effect.provide(
+          makeTestLayer(undefined, {
+            sandboxTransport: "auto",
+            executeTimeoutMs: 30_000,
+            shutdownGraceMs: 150
+          })
+        )
+      )
+    )
+
+    expect(elapsed).toBeLessThan(12_000)
+  }, 20_000)
+
+  test("transport canary: worker mode closes timed-out executions promptly", async () => {
+    const elapsed = await Effect.runPromise(
+      runTimeoutCloseCanary("worker").pipe(
+        Effect.provide(
+          makeTestLayer(undefined, {
+            sandboxTransport: "worker",
+            executeTimeoutMs: 30_000,
+            shutdownGraceMs: 150
+          })
+        )
+      )
+    )
+
+    expect(elapsed).toBeLessThan(12_000)
+  }, 20_000)
+
   test("execute timeout returns SandboxError", async () => {
     const result = await Effect.runPromise(
       Effect.scoped(
@@ -358,7 +416,8 @@ describe("SandboxBun", () => {
         Effect.provide(
           makeTestLayer(undefined, {
             workerPath: stubbornWorkerPath,
-            shutdownGraceMs: 150
+            shutdownGraceMs: 150,
+            sandboxTransport: "spawn"
           })
         )
       )
