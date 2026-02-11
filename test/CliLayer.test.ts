@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { makeCliConfig, makeCliTraceConfig, type CliArgs } from "../src/CliLayer"
+import { buildRlmModelLayer, makeCliConfig, makeCliTraceConfig, type CliArgs } from "../src/CliLayer"
 
 const baseArgs: CliArgs = {
   query: "query",
@@ -78,6 +78,9 @@ describe("CliLayer config mapping", () => {
     expect(config.maxDepth).toBe(1)
     expect(config.maxLlmCalls).toBe(200)
     expect(config.enablePromptCaching).toBe(true)
+    expect(config.llmRetryCount).toBe(1)
+    expect(config.llmRetryBaseDelayMs).toBe(100)
+    expect(config.llmRetryJitter).toBe(true)
   })
 
   test("maps explicit prompt caching disable", () => {
@@ -107,5 +110,16 @@ describe("CliLayer config mapping", () => {
 
     expect(traceConfig.enabled).toBe(false)
     expect(traceConfig.baseDir).toBe("/tmp/custom-traces")
+  })
+
+  test("buildRlmModelLayer uses resolved credentials from CliArgs", () => {
+    expect(() =>
+      buildRlmModelLayer({
+        ...baseArgs,
+        provider: "openai",
+        model: "gpt-test",
+        openaiApiKey: "test-openai-key"
+      })
+    ).not.toThrow()
   })
 })

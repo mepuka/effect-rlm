@@ -220,12 +220,24 @@ export const normalizeCliArgs = (
         ? Object.values(namedModels).map((target) => target.provider)
         : [])
     ])
+
+    let anthropicApiKey: string | undefined
+    let openaiApiKey: string | undefined
+    let googleApiKey: string | undefined
+
     for (const provider of requiredProviders) {
       const apiKey = env[providerApiKeyEnv(provider)]
       if (!apiKey) {
         return yield* failCliInput(
           `Error: missing ${providerApiKeyEnv(provider)} for provider ${provider}`
         )
+      }
+      if (provider === "anthropic") {
+        anthropicApiKey = apiKey
+      } else if (provider === "openai") {
+        openaiApiKey = apiKey
+      } else {
+        googleApiKey = apiKey
       }
     }
 
@@ -264,7 +276,13 @@ export const normalizeCliArgs = (
           }
         : {}),
       ...(traceDir !== undefined ? { traceDir } : {}),
-      ...(enablePromptCaching !== undefined ? { enablePromptCaching } : {})
+      ...(enablePromptCaching !== undefined ? { enablePromptCaching } : {}),
+      ...(anthropicApiKey !== undefined ? { anthropicApiKey } : {}),
+      ...(openaiApiKey !== undefined ? { openaiApiKey } : {}),
+      ...(googleApiKey !== undefined ? { googleApiKey } : {}),
+      ...(googleApiKey !== undefined && env.GOOGLE_API_URL !== undefined
+        ? { googleApiUrl: env.GOOGLE_API_URL }
+        : {})
     }
 
     return cliArgs

@@ -9,7 +9,8 @@ import { CliInputError } from "../src/cli/Normalize"
 const env = {
   ANTHROPIC_API_KEY: "anthropic-key",
   OPENAI_API_KEY: "openai-key",
-  GOOGLE_API_KEY: "google-key"
+  GOOGLE_API_KEY: "google-key",
+  GOOGLE_API_URL: "https://vertex.googleapis.com"
 }
 
 const runWithCapture = async (argv: ReadonlyArray<string>) => {
@@ -76,7 +77,9 @@ describe("Effect CLI command", () => {
       sandboxTransport: "auto",
       quiet: true,
       noColor: true,
-      nlpTools: false
+      nlpTools: false,
+      googleApiKey: "google-key",
+      googleApiUrl: "https://vertex.googleapis.com"
     })
   })
 
@@ -99,7 +102,8 @@ describe("Effect CLI command", () => {
       sandboxTransport: "auto",
       quiet: false,
       noColor: false,
-      nlpTools: false
+      nlpTools: false,
+      openaiApiKey: "openai-key"
     })
   })
 

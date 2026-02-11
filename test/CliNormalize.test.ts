@@ -37,7 +37,8 @@ const baseParsed: ParsedCliConfig = {
 const fullEnv = {
   ANTHROPIC_API_KEY: "anthropic-key",
   OPENAI_API_KEY: "openai-key",
-  GOOGLE_API_KEY: "google-key"
+  GOOGLE_API_KEY: "google-key",
+  GOOGLE_API_URL: "https://vertex.googleapis.com"
 }
 
 const normalize = (
@@ -90,7 +91,9 @@ describe("CLI normalization", () => {
       sandboxTransport: "auto",
       quiet: true,
       noColor: true,
-      nlpTools: false
+      nlpTools: false,
+      googleApiKey: "google-key",
+      googleApiUrl: "https://vertex.googleapis.com"
     })
   })
 
@@ -247,5 +250,30 @@ describe("CLI normalization", () => {
       { name: "diagram", url: "https://example.com/diagram.png" },
       { name: "photo", url: "https://example.com/override.jpg" }
     ])
+  })
+
+  test("includes resolved provider credentials for primary and named model providers", async () => {
+    const cliArgs = await normalize(
+      {
+        ...baseParsed,
+        provider: "anthropic",
+        namedModel: [
+          "fast=openai/gpt-4o-mini",
+          "vision=google/gemini-2.5-flash"
+        ]
+      },
+      [
+        "query",
+        "--named-model",
+        "fast=openai/gpt-4o-mini",
+        "--named-model",
+        "vision=google/gemini-2.5-flash"
+      ]
+    )
+
+    expect(cliArgs.anthropicApiKey).toBe("anthropic-key")
+    expect(cliArgs.openaiApiKey).toBe("openai-key")
+    expect(cliArgs.googleApiKey).toBe("google-key")
+    expect(cliArgs.googleApiUrl).toBe("https://vertex.googleapis.com")
   })
 })

@@ -38,6 +38,10 @@ export interface CliArgs {
   nlpTools: boolean
   noTrace?: boolean
   traceDir?: string
+  anthropicApiKey?: string
+  openaiApiKey?: string
+  googleApiKey?: string
+  googleApiUrl?: string
 }
 
 const targetToEffect = (
@@ -83,9 +87,11 @@ export const buildRlmModelLayer = (cliArgs: CliArgs): Layer.Layer<RlmModel, neve
     : undefined
 
   const modelLayer = makeRlmModelLayer({
+    primaryTarget,
     primary: targetToEffect(primaryTarget),
-    ...(subTarget !== undefined ? { sub: targetToEffect(subTarget) } : {}),
+    ...(subTarget !== undefined ? { sub: targetToEffect(subTarget), subTarget } : {}),
     ...(namedEffects !== undefined ? { named: namedEffects } : {}),
+    ...(named !== undefined ? { namedTargets: named } : {}),
     subLlmDelegation
   })
 
@@ -97,33 +103,42 @@ export const buildRlmModelLayer = (cliArgs: CliArgs): Layer.Layer<RlmModel, neve
 
   const clientLayers: Array<Layer.Layer<any, never, never>> = []
   if (providers.has("anthropic")) {
+    if (cliArgs.anthropicApiKey === undefined) {
+      throw new Error("Missing anthropicApiKey in CliArgs for anthropic provider")
+    }
     clientLayers.push(
       Layer.provide(
         AnthropicClient.layer({
-          apiKey: Redacted.make(Bun.env.ANTHROPIC_API_KEY!)
+          apiKey: Redacted.make(cliArgs.anthropicApiKey)
         }),
         httpLayer
       )
     )
   }
   if (providers.has("openai")) {
+    if (cliArgs.openaiApiKey === undefined) {
+      throw new Error("Missing openaiApiKey in CliArgs for openai provider")
+    }
     clientLayers.push(
       Layer.provide(
         OpenAiClient.layer({
-          apiKey: Redacted.make(Bun.env.OPENAI_API_KEY!)
+          apiKey: Redacted.make(cliArgs.openaiApiKey)
         }),
         httpLayer
       )
     )
   }
   if (providers.has("google")) {
-    const useVertexAi = Bun.env.GOOGLE_API_URL !== undefined
+    if (cliArgs.googleApiKey === undefined) {
+      throw new Error("Missing googleApiKey in CliArgs for google provider")
+    }
+    const useVertexAi = cliArgs.googleApiUrl !== undefined
     clientLayers.push(
       Layer.provide(
         GoogleClient.layer({
-          apiKey: Redacted.make(Bun.env.GOOGLE_API_KEY!),
+          apiKey: Redacted.make(cliArgs.googleApiKey),
           ...(useVertexAi ? {
-            apiUrl: Bun.env.GOOGLE_API_URL,
+            apiUrl: cliArgs.googleApiUrl,
             transformClient: (client: HttpClient.HttpClient) =>
               HttpClient.mapRequest(client, (req) => {
                 const url = new URL(req.url)
@@ -168,6 +183,9 @@ export const makeCliConfig = (cliArgs: CliArgs): RlmConfigService => {
     eventBufferCapacity: 4096,
     maxExecutionOutputChars: 8_000,
     enablePromptCaching: cliArgs.enablePromptCaching ?? true,
+    llmRetryCount: 1,
+    llmRetryBaseDelayMs: 100,
+    llmRetryJitter: true,
     primaryTarget: {
       provider: cliArgs.provider,
       model: cliArgs.model
