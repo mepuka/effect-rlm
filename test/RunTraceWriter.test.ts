@@ -141,6 +141,52 @@ describe("RunTraceWriter", () => {
     }
   })
 
+  test("snapshot truncation uses small-first ordering and includes manifest", async () => {
+    const [rootStore, varsStore] = await Effect.runPromise(
+      Effect.all([makeMemoryStore(), makeMemoryStore()])
+    )
+    const writer = makeRunTraceWriter({
+      rootStore,
+      varsStore,
+      maxSnapshotBytes: 400
+    })
+
+    await Effect.runPromise(
+      writer.writeVarSnapshot({
+        callId: "root",
+        depth: 0,
+        iteration: 1,
+        vars: {
+          huge: "x".repeat(2_000),
+          tiny: 42,
+          medium: "hello world",
+          contextCorpusId: "feed"
+        }
+      })
+    )
+
+    const stored = await Effect.runPromise(
+      varsStore.get("call-root.depth-0.iter-001.json")
+    )
+    expect(Option.isSome(stored)).toBe(true)
+    if (Option.isSome(stored)) {
+      const parsed = JSON.parse(stored.value)
+      // Small variables should be included
+      expect(parsed.vars.tiny).toBe(42)
+      expect(parsed.vars.contextCorpusId).toBe("feed")
+      // Huge variable should be truncated
+      expect(parsed.vars.huge).toBeUndefined()
+      // Truncation sentinel should be present
+      expect(parsed.vars.__trace_truncated__).toBeDefined()
+      // Manifest should list all variable names with sizes
+      expect(parsed.__trace_manifest__).toBeDefined()
+      expect(parsed.__trace_manifest__.tiny).toBeDefined()
+      expect(parsed.__trace_manifest__.huge).toBeDefined()
+      expect(parsed.__trace_manifest__.contextCorpusId).toBeDefined()
+      expect(parsed.__trace_manifest__.medium).toBeDefined()
+    }
+  })
+
   test("default RunTraceWriter reference is no-op", async () => {
     await Effect.runPromise(
       Effect.gen(function*() {

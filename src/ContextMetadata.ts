@@ -17,11 +17,50 @@ export interface ContextMetadata {
   readonly fields?: ReadonlyArray<string>
   readonly recordCount?: number
   readonly sampleRecord?: string
+  readonly primaryTextField?: string
 }
 
 const MAX_SAMPLE_RECORD_CHARS = 220
 const MAX_FIELDS = 24
 export const MAX_JSON_METADATA_PARSE_CHARS = 250_000
+const MIN_PRIMARY_TEXT_CHARS = 50
+
+const TEXT_FIELD_NAME_PRIORS: ReadonlyArray<readonly [RegExp, number]> = [
+  [/^(body_markdown|body_text|body|body_html)$/i, 10],
+  [/^(text|content|markdown)$/i, 8],
+  [/^(message|description|abstract|summary)$/i, 5],
+  [/^(title|subject|name)$/i, 2]
+]
+
+const TEXT_FIELD_BLOCKLIST = /^(url|uri|href|link|id|_id|slug|path|hash|image|img|icon|avatar|thumb)/i
+
+const namePrior = (field: string): number => {
+  for (const [pattern, score] of TEXT_FIELD_NAME_PRIORS) {
+    if (pattern.test(field)) return score
+  }
+  return 1
+}
+
+export const detectPrimaryTextField = (record: unknown): string | undefined => {
+  if (!isRecord(record)) return undefined
+
+  let bestField: string | undefined
+  let bestScore = 0
+
+  for (const [key, value] of Object.entries(record)) {
+    if (typeof value !== "string") continue
+    if (value.length < MIN_PRIMARY_TEXT_CHARS) continue
+    if (TEXT_FIELD_BLOCKLIST.test(key)) continue
+
+    const score = namePrior(key) * Math.log2(Math.max(value.length, 1))
+    if (score > bestScore) {
+      bestScore = score
+      bestField = key
+    }
+  }
+
+  return bestField
+}
 
 const numberFormatter = new Intl.NumberFormat("en-US")
 
@@ -285,11 +324,13 @@ export const analyzeContext = (content: string, fileName?: string): ContextMetad
     const firstLine = lineStats.firstNonEmptyLine
     const firstRecord = firstLine !== undefined ? tryParseJson(firstLine) : undefined
     const fields = extractFieldPaths(firstRecord)
+    const primaryTextField = detectPrimaryTextField(firstRecord)
     return {
       ...baseMetadata,
       recordCount: lineStats.nonEmptyLines,
       ...(fields !== undefined ? { fields } : {}),
-      ...(firstLine !== undefined ? { sampleRecord: toSampleRecord(firstLine.trim()) } : {})
+      ...(firstLine !== undefined ? { sampleRecord: toSampleRecord(firstLine.trim()) } : {}),
+      ...(primaryTextField !== undefined ? { primaryTextField } : {})
     }
   }
 
@@ -302,12 +343,14 @@ export const analyzeContext = (content: string, fileName?: string): ContextMetad
       if (Array.isArray(parsedJson)) {
         const first = parsedJson[0]
         const fields = first !== undefined ? extractFieldPaths(first) : undefined
+        const primaryTextField = detectPrimaryTextField(first)
         return {
           ...baseMetadata,
           format: "json-array",
           recordCount: parsedJson.length,
           ...(fields !== undefined ? { fields } : {}),
-          ...(first !== undefined ? { sampleRecord: toSampleFromUnknown(first) } : {})
+          ...(first !== undefined ? { sampleRecord: toSampleFromUnknown(first) } : {}),
+          ...(primaryTextField !== undefined ? { primaryTextField } : {})
         }
       }
 

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   analyzeContext,
+  detectPrimaryTextField,
   formatContextHint,
   MAX_JSON_METADATA_PARSE_CHARS
 } from "../src/ContextMetadata"
@@ -134,6 +135,95 @@ describe("ContextMetadata.analyzeContext", () => {
     expect(meta.format).toBe("json")
     expect(meta.fields).toBeUndefined()
     expect(meta.sampleRecord).toBeUndefined()
+  })
+})
+
+describe("ContextMetadata.detectPrimaryTextField", () => {
+  test("picks body_markdown over url for BTI-shaped record", () => {
+    const record = {
+      url: "https://example.com/article/123",
+      title: "Short Title",
+      body_markdown: "A".repeat(200)
+    }
+    expect(detectPrimaryTextField(record)).toBe("body_markdown")
+  })
+
+  test("picks text over description when text is longer", () => {
+    const record = {
+      text: "B".repeat(100),
+      description: "C".repeat(80)
+    }
+    expect(detectPrimaryTextField(record)).toBe("text")
+  })
+
+  test("name-prior tiebreaks when lengths are similar", () => {
+    // "content" has prior 8, "message" has prior 5 — content wins even at equal length
+    const record = {
+      content: "D".repeat(100),
+      message: "E".repeat(100)
+    }
+    expect(detectPrimaryTextField(record)).toBe("content")
+  })
+
+  test("returns undefined when all strings are too short", () => {
+    const record = {
+      id: "abc",
+      name: "short",
+      url: "https://example.com"
+    }
+    expect(detectPrimaryTextField(record)).toBeUndefined()
+  })
+
+  test("blocklisted fields (url, id, slug, path) are skipped", () => {
+    const record = {
+      url: "A".repeat(500),
+      id: "B".repeat(500),
+      slug: "C".repeat(500),
+      path: "D".repeat(500),
+      body: "E".repeat(60)
+    }
+    expect(detectPrimaryTextField(record)).toBe("body")
+  })
+
+  test("returns undefined for non-record input", () => {
+    expect(detectPrimaryTextField("hello")).toBeUndefined()
+    expect(detectPrimaryTextField(null)).toBeUndefined()
+    expect(detectPrimaryTextField(42)).toBeUndefined()
+  })
+
+  test("body_html beats unknown field names via prior", () => {
+    const record = {
+      custom_data: "F".repeat(200),
+      body_html: "G".repeat(200)
+    }
+    expect(detectPrimaryTextField(record)).toBe("body_html")
+  })
+})
+
+describe("ContextMetadata.analyzeContext primaryTextField", () => {
+  test("NDJSON with body_markdown detects primaryTextField", () => {
+    const record = { url: "https://example.com", body_markdown: "A".repeat(200) }
+    const content = JSON.stringify(record) + "\n" + JSON.stringify({ url: "https://other.com", body_markdown: "B".repeat(100) })
+    const meta = analyzeContext(content, "articles.ndjson")
+
+    expect(meta.primaryTextField).toBe("body_markdown")
+  })
+
+  test("JSON array with body detects primaryTextField", () => {
+    const content = JSON.stringify([
+      { id: 1, body: "X".repeat(100) },
+      { id: 2, body: "Y".repeat(100) }
+    ])
+    const meta = analyzeContext(content, "data.json")
+
+    expect(meta.primaryTextField).toBe("body")
+  })
+
+  test("NDJSON with only short fields has no primaryTextField", () => {
+    const content = "{\"id\":1,\"name\":\"A\"}\n{\"id\":2,\"name\":\"B\"}"
+    const meta = analyzeContext(content, "short.ndjson")
+
+    expect(meta.primaryTextField).toBeUndefined()
   })
 })
 

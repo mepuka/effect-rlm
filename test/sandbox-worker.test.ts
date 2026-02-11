@@ -521,6 +521,205 @@ describe("sandbox-worker", () => {
     expect(result.output).toBe("undefined\nundefined\nundefined\nundefined")
   })
 
+  test("init_corpus_from_context uses primaryTextField from contextMeta", async () => {
+    handle = spawnWorker()
+    handle.proc.send({
+      _tag: "Init",
+      callId: "test-call",
+      depth: 0,
+      tools: [
+        { name: "CreateCorpus", parameterNames: ["corpusId"] },
+        { name: "LearnCorpus", parameterNames: ["corpusId", "documents", "dedupeById"] }
+      ]
+    })
+    await Bun.sleep(100)
+
+    // Set context with body_markdown field (BTI-shaped records)
+    handle.proc.send({
+      _tag: "SetVar",
+      requestId: "set-context",
+      name: "context",
+      value: JSON.stringify({ url: "https://example.com", body_markdown: "Hello world content here" }) +
+        "\n" +
+        JSON.stringify({ url: "https://other.com", body_markdown: "Another article body" })
+    })
+    await handle.waitForMessage()
+
+    handle.proc.send({
+      _tag: "SetVar",
+      requestId: "set-meta",
+      name: "contextMeta",
+      value: { format: "ndjson", primaryTextField: "body_markdown" }
+    })
+    await handle.waitForMessage()
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "exec-primary-field",
+      code: `const summary = await init_corpus_from_context({ corpusId: "bti" }); print(summary.documentsLearned)`
+    })
+
+    const createCall = await handle.waitForMessage()
+    expect(createCall._tag).toBe("BridgeCall")
+    expect(createCall.method).toBe("CreateCorpus")
+
+    handle.proc.send({
+      _tag: "BridgeResult",
+      requestId: createCall.requestId,
+      result: { corpusId: "bti" }
+    })
+
+    const learnCall = await handle.waitForMessage()
+    expect(learnCall._tag).toBe("BridgeCall")
+    expect(learnCall.method).toBe("LearnCorpus")
+    // Verify documents have body_markdown content, not URLs
+    const docs = learnCall.args as Array<unknown>
+    const learnedDocs = docs[1] as Array<{ id: string; text: string }>
+    expect(learnedDocs[0]!.text).toBe("Hello world content here")
+    expect(learnedDocs[1]!.text).toBe("Another article body")
+
+    handle.proc.send({
+      _tag: "BridgeResult",
+      requestId: learnCall.requestId,
+      result: { learned: 2 }
+    })
+
+    const execResult = await handle.waitForMessage()
+    expect(execResult._tag).toBe("ExecResult")
+    expect(execResult.output).toBe("2")
+  })
+
+  test("ReferenceError includes __vars hint when variable not in vars", async () => {
+    handle = spawnWorker()
+    handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0 })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "req-referr",
+      code: "print(results)"
+    })
+
+    const result = await handle.waitForMessage()
+    expect(result._tag).toBe("ExecError")
+    expect(String(result.message)).toContain("results is not defined")
+    expect(String(result.message)).toContain("Hint:")
+    expect(String(result.message)).toContain("__vars.results")
+  })
+
+  test("ReferenceError omits hint when variable IS in __vars", async () => {
+    handle = spawnWorker()
+    handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0 })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "SetVar",
+      requestId: "set-results",
+      name: "results",
+      value: [1, 2, 3]
+    })
+    await handle.waitForMessage()
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "req-referr-no-hint",
+      code: "print(results)"
+    })
+
+    const result = await handle.waitForMessage()
+    expect(result._tag).toBe("ExecError")
+    expect(String(result.message)).toContain("results is not defined")
+    expect(String(result.message)).not.toContain("Hint:")
+  })
+
+  test("body_markdown in expanded candidateFields works in pickTextFromRecord", async () => {
+    handle = spawnWorker()
+    handle.proc.send({
+      _tag: "Init",
+      callId: "test-call",
+      depth: 0,
+      tools: [
+        { name: "CreateCorpus", parameterNames: ["corpusId"] },
+        { name: "LearnCorpus", parameterNames: ["corpusId", "documents", "dedupeById"] }
+      ]
+    })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "exec-candidate-fields",
+      code: `
+        const docs = [
+          { url: "https://foo.com", body_markdown: "article body one" },
+          { url: "https://bar.com", body_markdown: "article body two" }
+        ]
+        const summary = await init_corpus(docs, { corpusId: "test", batchSize: 10 })
+        print(summary.documentsLearned)
+      `
+    })
+
+    const createCall = await handle.waitForMessage()
+    expect(createCall._tag).toBe("BridgeCall")
+    handle.proc.send({ _tag: "BridgeResult", requestId: createCall.requestId, result: { corpusId: "test" } })
+
+    const learnCall = await handle.waitForMessage()
+    expect(learnCall._tag).toBe("BridgeCall")
+    const learnedDocs = (learnCall.args as Array<unknown>)[1] as Array<{ id: string; text: string }>
+    // body_markdown should be picked since it's in expanded candidateFields
+    expect(learnedDocs[0]!.text).toBe("article body one")
+    expect(learnedDocs[1]!.text).toBe("article body two")
+
+    handle.proc.send({ _tag: "BridgeResult", requestId: learnCall.requestId, result: { learned: 2 } })
+
+    const execResult = await handle.waitForMessage()
+    expect(execResult._tag).toBe("ExecResult")
+    expect(execResult.output).toBe("2")
+  })
+
+  test("budget() bridge call returns non-empty object with expected fields", async () => {
+    handle = spawnWorker()
+    handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0 })
+    await Bun.sleep(100)
+
+    handle.proc.send({
+      _tag: "ExecRequest",
+      requestId: "exec-budget",
+      code: "const b = await budget(); print(JSON.stringify(b))"
+    })
+
+    // First message should be BridgeCall for budget
+    const bridgeCall = await handle.waitForMessage()
+    expect(bridgeCall._tag).toBe("BridgeCall")
+    expect(bridgeCall.method).toBe("budget")
+    expect(bridgeCall.args).toEqual([])
+
+    // Respond with budget data
+    const budgetData = {
+      iterationsRemaining: 8,
+      llmCallsRemaining: 15,
+      tokenBudgetRemaining: null,
+      totalTokensUsed: 1234,
+      elapsedMs: 5000,
+      maxTimeMs: 300000
+    }
+    handle.proc.send({
+      _tag: "BridgeResult",
+      requestId: bridgeCall.requestId,
+      result: budgetData
+    })
+
+    const execResult = await handle.waitForMessage()
+    expect(execResult._tag).toBe("ExecResult")
+    const parsed = JSON.parse(String(execResult.output))
+    expect(parsed.iterationsRemaining).toBe(8)
+    expect(parsed.llmCallsRemaining).toBe(15)
+    expect(parsed.totalTokensUsed).toBe(1234)
+    expect(parsed.elapsedMs).toBe(5000)
+    expect(parsed.maxTimeMs).toBe(300000)
+    // Verify it's not an empty object
+    expect(Object.keys(parsed).length).toBeGreaterThanOrEqual(5)
+  })
+
   test("Shutdown → clean exit", async () => {
     handle = spawnWorker()
     handle.proc.send({ _tag: "Init", callId: "test-call", depth: 0 })

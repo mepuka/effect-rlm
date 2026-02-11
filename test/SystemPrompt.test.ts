@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildExtractSystemPrompt } from "../src/SystemPrompt"
+import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildOneShotJsonSystemPrompt, buildExtractSystemPrompt } from "../src/SystemPrompt"
 
 describe("SystemPrompt", () => {
   const baseOptions = {
@@ -103,6 +103,27 @@ describe("SystemPrompt", () => {
     const prompt = buildReplSystemPrompt(baseOptions)
     expect(prompt).toContain("Iterations remaining: 9")
     expect(prompt).toContain("LLM calls remaining: 19")
+  })
+
+  test("REPL prompt Budget section header references budget() for live values", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("call `budget()` in code for live values")
+  })
+
+  test("REPL prompt documents all budget() return fields when canRecurse", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
+    expect(prompt).toContain("b.iterationsRemaining")
+    expect(prompt).toContain("b.llmCallsRemaining")
+    expect(prompt).toContain("b.tokenBudgetRemaining")
+    expect(prompt).toContain("b.totalTokensUsed")
+    expect(prompt).toContain("b.elapsedMs")
+    expect(prompt).toContain("b.maxTimeMs")
+  })
+
+  test("REPL prompt omits budget() API reference when cannot recurse", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 1, maxDepth: 1 })
+    expect(prompt).not.toContain("b.iterationsRemaining")
+    expect(prompt).not.toContain("b.llmCallsRemaining")
   })
 
   test("REPL prompt instructs to access __vars.context, __vars.query, and __vars.contextMeta", () => {
@@ -563,6 +584,70 @@ describe("SystemPrompt", () => {
     expect(prompt).toContain("NDJSON, JSON array, CSV, and TSV")
   })
 
+  test("REPL prompt shows detected primaryTextField in context guidance", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      contextMetadata: {
+        format: "ndjson",
+        chars: 60_000,
+        lines: 500,
+        recordCount: 180,
+        primaryTextField: "body_markdown"
+      },
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus")
+      ]
+    })
+    expect(prompt).toContain("Detected primary text field: `body_markdown`")
+    expect(prompt).toContain("init_corpus_from_context")
+  })
+
+  test("REPL prompt omits primaryTextField line when not detected", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      contextMetadata: {
+        format: "ndjson",
+        chars: 60_000,
+        lines: 500,
+        recordCount: 180
+      },
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus")
+      ]
+    })
+    expect(prompt).not.toContain("Detected primary text field")
+  })
+
+  test("REPL prompt contains cross-iteration variable scoping warning", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("Do NOT reference `const`/`let` variables from a previous iteration")
+    expect(prompt).toContain("WRONG: Iter 1: `const results = ...`")
+    expect(prompt).toContain("RIGHT: Iter 1: `__vars.results = ...`")
+  })
+
+  test("corpus guidance mentions textField override option", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus")
+      ]
+    })
+    expect(prompt).toContain("textField")
+    expect(prompt).toContain("body_markdown")
+  })
+
   test("non-structured contextMetadata format omits context-specific guidance", () => {
     const prompt = buildReplSystemPrompt({
       ...baseOptions,
@@ -582,6 +667,144 @@ describe("SystemPrompt", () => {
       ]
     })
     expect(prompt).not.toContain("### Context-Specific Guidance")
+  })
+
+  test("REPL prompt contains First Iteration Protocol with planning guidance", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("### First Iteration Protocol")
+    expect(prompt).toContain("Classify the task")
+    expect(prompt).toContain("// PLAN:")
+    expect(prompt).toContain("Execute step 1 of your plan")
+  })
+
+  test("REPL prompt contains budget feasibility in planning when canRecurse", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
+    expect(prompt).toContain("Compute budget feasibility")
+    expect(prompt).toContain("await budget()")
+    expect(prompt).toContain("maxProcessable")
+  })
+
+  test("REPL prompt omits budget feasibility in planning when depth >= maxDepth", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 1, maxDepth: 1 })
+    expect(prompt).not.toContain("Compute budget feasibility")
+  })
+
+  test("REPL prompt contains Record Selection hierarchy when canRecurse", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
+    expect(prompt).toContain("## Record Selection for Structured Data")
+    expect(prompt).toContain("FIELD MATCHING")
+    expect(prompt).toContain("REGEX/KEYWORD")
+    expect(prompt).toContain("LLM CLASSIFICATION")
+    expect(prompt).toContain("NEVER spend multiple iterations retrying")
+  })
+
+  test("REPL prompt Record Selection includes BM25 when corpus workflow available", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      depth: 0,
+      maxDepth: 1,
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus")
+      ]
+    })
+    expect(prompt).toContain("BM25 CORPUS")
+    expect(prompt).toContain("scores approach zero")
+    expect(prompt).toContain("top scores < 0.1")
+  })
+
+  test("REPL prompt Record Selection omits BM25 when no corpus workflow", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
+    expect(prompt).toContain("## Record Selection for Structured Data")
+    expect(prompt).not.toContain("BM25 CORPUS")
+  })
+
+  test("REPL prompt omits Record Selection when depth >= maxDepth", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 1, maxDepth: 1 })
+    expect(prompt).not.toContain("## Record Selection for Structured Data")
+  })
+
+  test("REPL prompt contains Recursive Decomposition strategy when canRecurse", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
+    expect(prompt).toContain("### Recursive Decomposition for Large Datasets")
+    expect(prompt).toContain("Explore → Filter → Decompose → Process → Aggregate")
+    expect(prompt).toContain("Coverage Calculation")
+    expect(prompt).toContain("Budget Allocation")
+    expect(prompt).toContain("Sub-Call Behavior")
+    expect(prompt).toContain("ONE-SHOT")
+  })
+
+  test("REPL prompt omits Recursive Decomposition when depth >= maxDepth", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 1, maxDepth: 1 })
+    expect(prompt).not.toContain("### Recursive Decomposition for Large Datasets")
+  })
+
+  test("REPL prompt contains variable cleanup guidance", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("delete __vars.rawArticles")
+    expect(prompt).toContain("waste context tokens")
+  })
+
+  test("REPL prompt contains Reassessment section", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("### Reassessment")
+    expect(prompt).toContain("past iteration 3")
+    expect(prompt).toContain("different strategy")
+    expect(prompt).toContain("Do NOT keep retrying")
+  })
+
+  test("REPL prompt Reassessment includes budget check when canRecurse", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
+    expect(prompt).toContain("Check remaining budget")
+  })
+
+  test("REPL prompt contains BM25 caveats in corpus section", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      tools: [
+        makeTool("CreateCorpus"),
+        makeTool("LearnCorpus"),
+        makeTool("QueryCorpus"),
+        makeTool("CorpusStats"),
+        makeTool("DeleteCorpus")
+      ]
+    })
+    expect(prompt).toContain("BM25 performance degrades significantly")
+    expect(prompt).toContain("documents >2,000 words")
+    expect(prompt).toContain("metadata fields")
+    expect(prompt).toContain("code filtering FIRST")
+    expect(prompt).toContain("top scores < 0.1")
+  })
+
+  test("REPL prompt contains phase indicator in budget section", () => {
+    const earlyPrompt = buildReplSystemPrompt({
+      ...baseOptions,
+      iteration: 1,
+      budget: { iterationsRemaining: 9, llmCallsRemaining: 19 }
+    })
+    expect(earlyPrompt).toContain("Phase: EXPLORE/PLAN")
+
+    const midPrompt = buildReplSystemPrompt({
+      ...baseOptions,
+      iteration: 5,
+      maxIterations: 10,
+      budget: { iterationsRemaining: 5, llmCallsRemaining: 15 }
+    })
+    expect(midPrompt).toContain("Phase: EXECUTE")
+
+    const latePrompt = buildReplSystemPrompt({
+      ...baseOptions,
+      iteration: 9,
+      maxIterations: 10,
+      budget: { iterationsRemaining: 1, llmCallsRemaining: 5 }
+    })
+    expect(latePrompt).toContain("Phase: SYNTHESIZE/SUBMIT")
+  })
+
+  test("REPL prompt no longer contains old 'Budget-aware chunking strategy' section", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
+    expect(prompt).not.toContain("### Budget-aware chunking strategy")
   })
 })
 
@@ -612,5 +835,76 @@ describe("buildExtractSystemPrompt", () => {
   test("omits schema section when not provided", () => {
     const prompt = buildExtractSystemPrompt()
     expect(prompt).not.toContain("valid JSON matching this schema")
+  })
+})
+
+describe("buildOneShotJsonSystemPrompt", () => {
+  test("includes JSON schema and strict JSON-only instructions", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        actors: {
+          type: "array",
+          items: { type: "object", properties: { name: { type: "string" } } }
+        }
+      },
+      required: ["actors"]
+    }
+    const prompt = buildOneShotJsonSystemPrompt(schema)
+    expect(prompt).toContain("valid JSON")
+    expect(prompt).toContain("Required JSON Schema")
+    expect(prompt).toContain('"actors"')
+    expect(prompt).toContain("Do not include any text before or after the JSON")
+    expect(prompt).toContain("Do not use markdown code fences")
+  })
+
+  test("schema is serialized as pretty-printed JSON", () => {
+    const schema = { type: "object", properties: { x: { type: "number" } } }
+    const prompt = buildOneShotJsonSystemPrompt(schema)
+    // Should be multi-line (pretty-printed), not single-line
+    expect(prompt).toContain('"type": "object"')
+  })
+})
+
+describe("SystemPrompt responseFormat and depth>1 guidance", () => {
+  const baseOptions = {
+    depth: 0,
+    iteration: 1,
+    maxIterations: 10,
+    maxDepth: 2,
+    budget: { iterationsRemaining: 9, llmCallsRemaining: 19 }
+  }
+
+  test("includes responseFormat documentation when canRecurse", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("responseFormat")
+    expect(prompt).toContain("Structured Output")
+    expect(prompt).toContain("parsed object")
+  })
+
+  test("omits responseFormat documentation when depth >= maxDepth (cannot recurse)", () => {
+    const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 2, maxDepth: 2 })
+    expect(prompt).not.toContain("Structured Output (responseFormat)")
+  })
+
+  test("includes recursive sub-call guidance when depth allows sub-sub-calls", () => {
+    // depth=0, maxDepth=3 → sub-calls at depth 1 can still recurse (1 < 3-1=2)
+    const prompt = buildReplSystemPrompt({ ...baseOptions, maxDepth: 3 })
+    expect(prompt).toContain("Recursive Sub-Calls")
+    expect(prompt).toContain("own REPL")
+  })
+
+  test("omits recursive sub-call guidance when sub-calls would be one-shot", () => {
+    // depth=0, maxDepth=1 → sub-calls at depth 1 are one-shot (1 >= 1)
+    const prompt = buildReplSystemPrompt({ ...baseOptions, maxDepth: 1 })
+    expect(prompt).not.toContain("Recursive Sub-Calls (depth > 1)")
+  })
+
+  test("omits recursive sub-call guidance when maxDepth=2 (sub-calls at max depth)", () => {
+    // depth=0, maxDepth=2 → sub-calls at depth 1, which is < maxDepth=2 but
+    // sub-sub-calls would be at depth 2 >= maxDepth → sub-calls' children are one-shot
+    // The condition is depth < maxDepth - 1 (0 < 2-1=1 → true), so guidance should appear
+    const prompt = buildReplSystemPrompt({ ...baseOptions, maxDepth: 2 })
+    expect(prompt).toContain("Recursive Sub-Calls")
   })
 })

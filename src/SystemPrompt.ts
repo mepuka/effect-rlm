@@ -160,7 +160,16 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   lines.push("- Only the FIRST code block in your response is executed. Do not include multiple code blocks.")
   if (canRecurse) {
     lines.push("- `print()`, `llm_query()`, `llm_query_batched()`, and all tool functions are sandbox functions. They exist ONLY inside the ```js sandbox. Call them ONLY inside ```js code blocks. Do NOT invoke them as external tool calls — the only external tool available is SUBMIT.")
-    lines.push("- `budget()` is available inside sandbox code and returns live budget fields.")
+    lines.push("- `budget()` returns a live snapshot of remaining resources:")
+    lines.push("  ```js")
+    lines.push("  const b = await budget()")
+    lines.push("  // b.iterationsRemaining  — REPL iterations left (int)")
+    lines.push("  // b.llmCallsRemaining    — llm_query/llm_query_batched calls left (int)")
+    lines.push("  // b.tokenBudgetRemaining — tokens left (int | null if unlimited)")
+    lines.push("  // b.totalTokensUsed      — tokens consumed so far (int)")
+    lines.push("  // b.elapsedMs            — wall-clock ms since call started (int)")
+    lines.push("  // b.maxTimeMs            — time limit in ms (int | null if unlimited)")
+    lines.push("  ```")
     if (options.mediaNames !== undefined && options.mediaNames.length > 0) {
       lines.push("- `llm_query_with_media(prompt, ...mediaNames)` is available for multimodal sub-queries.")
     }
@@ -173,28 +182,91 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   lines.push("__vars.results = [1, 2, 3]  // persists to next execution")
   lines.push("let temp = 42                // gone next execution")
   lines.push("```")
+  lines.push("Clean up intermediate data when no longer needed:")
+  lines.push("```js")
+  lines.push("delete __vars.rawArticles   // free memory after extraction")
+  lines.push("delete __vars.rawExtractions // don't carry forward parsed intermediates")
+  lines.push("```")
+  lines.push("Large `__vars` waste context tokens. Keep only what you need for remaining iterations.")
   lines.push("")
   lines.push("## Strategy")
   lines.push("You have multiple iterations. Use them. Do NOT try to finish everything in one step.")
-  lines.push("On your FIRST iteration, use a single code block to inspect data and execute step 1 immediately.")
-  lines.push("If useful, write your plan as short comments inside that code block.")
-  lines.push("1. Inspect data shape and size with code.")
-  lines.push("2. Decompose the query into sub-tasks.")
+  lines.push("")
+  lines.push("### First Iteration Protocol")
+  lines.push("On your FIRST iteration:")
+  lines.push("1. Inspect data shape, size, and schema with code.")
+  lines.push("2. Classify the task: exhaustive extraction | selective retrieval | aggregation | cross-document synthesis | lookup | classification.")
   if (canRecurse) {
-    lines.push("3. Classify each sub-task:")
+    lines.push("3. Compute budget feasibility:")
+    lines.push("   ```js")
+    lines.push("   const b = await budget()")
+    lines.push("   const perBatch = 15")
+    lines.push("   const maxProcessable = Math.floor(b.llmCallsRemaining * 0.6) * perBatch")
+    lines.push("   if (maxProcessable >= total) { /* exhaustive */ } else { /* sample */ }")
+    lines.push("   ```")
+  }
+  if (canRecurse) {
+    lines.push("4. Write your plan as comments at the TOP of your code:")
+    lines.push("   ```")
+    lines.push("   // PLAN:")
+    lines.push("   // Task type: cross-document synthesis")
+    lines.push("   // Filter: code field-matching on topics/title")
+    lines.push("   // Processing: llm_query_batched, 15/batch, ~67 calls")
+    lines.push("   // Phases: explore(1) → filter(2) → extract(3-8) → synthesize(9-10) → submit(11)")
+    lines.push("   ```")
+    lines.push("5. Execute step 1 of your plan in the same code block.")
+  } else {
+    lines.push("3. Write your plan as comments at the TOP of your code.")
+    lines.push("4. Execute step 1 of your plan in the same code block.")
+  }
+  lines.push("")
+  lines.push("### Subsequent Iterations")
+  lines.push("1. Decompose the query into sub-tasks.")
+  if (canRecurse) {
+    lines.push("2. Classify each sub-task:")
     lines.push("   - MECHANICAL (counting, filtering, regex, math, formatting) -> code")
     lines.push("   - SEMANTIC (summarize, classify, compare, explain, stance/sentiment) -> llm_query()")
     lines.push("   - HYBRID (extract with code, analyze with llm_query) -> both")
   } else {
-    lines.push("3. Solve sub-tasks with code in dependency order.")
+    lines.push("2. Solve sub-tasks with code in dependency order.")
   }
-  lines.push("4. Aggregate near the end and verify before submitting.")
+  lines.push("3. Aggregate near the end and verify before submitting.")
   lines.push("")
+  lines.push("### Reassessment")
+  lines.push("If past iteration 3 and your current approach is not producing results:")
+  lines.push("- STOP and print a diagnostic: what failed and why.")
+  if (canRecurse) {
+    lines.push("- Check remaining budget with `budget()`.")
+    lines.push("- Choose a different strategy from the Record Selection hierarchy below.")
+  } else {
+    lines.push("- Try a different approach.")
+  }
+  lines.push("- Do NOT keep retrying the same failing approach.")
+  lines.push("")
+  if (canRecurse) {
+    lines.push("## Record Selection for Structured Data")
+    lines.push("When filtering records from structured datasets, prefer in this order:")
+    lines.push("1. FIELD MATCHING on metadata (topics, categories, tags, title) — instant, high precision.")
+    lines.push("2. REGEX/KEYWORD on text body — fast, controllable.")
+    if (hasCorpusWorkflow) {
+      lines.push("3. BM25 CORPUS — only for unstructured text without metadata fields.")
+      lines.push("   ⚠️ BM25 scores approach zero on documents >2,000 words.")
+      lines.push("   If top scores < 0.1 on your first query, STOP and switch to code filtering.")
+    }
+    lines.push(`${hasCorpusWorkflow ? "4" : "3"}. LLM CLASSIFICATION — only when the criterion is truly semantic.`)
+    lines.push("")
+    lines.push("NEVER spend multiple iterations retrying a failing search strategy.")
+    lines.push("")
+  }
+
   if (hasLargeStructuredContext) {
     const recordCount = options.contextMetadata?.recordCount ?? 0
     const format = options.contextMetadata?.format ?? "structured"
     lines.push("### Context-Specific Guidance")
     lines.push(`Detected ${format} context with about ${recordCount} records.`)
+    if (options.contextMetadata?.primaryTextField !== undefined) {
+      lines.push(`Detected primary text field: \`${options.contextMetadata.primaryTextField}\` — \`init_corpus_from_context\` will use it automatically.`)
+    }
     lines.push("For selective retrieval tasks, prefer a retrieval-first pattern over scanning every record:")
     lines.push("1. Parse records from `__vars.context`.")
     lines.push("2. Build one corpus: `CreateCorpus` + batched `LearnCorpus` (~500 records per call), or call `init_corpus_from_context({ corpusId, batchSize })`.")
@@ -263,6 +335,9 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     lines.push("  WRONG: Calling llm_query as a tool call")
     lines.push("  RIGHT: ```js\\nconst result = await llm_query('summarize this', text)\\n```")
   }
+  lines.push("- Do NOT reference `const`/`let` variables from a previous iteration — they are gone. Store in `__vars`:")
+  lines.push("  WRONG: Iter 1: `const results = ...` → Iter 2: `results[0]` → ReferenceError")
+  lines.push("  RIGHT: Iter 1: `__vars.results = ...` → Iter 2: `__vars.results[0]`")
   lines.push("- Do NOT write prose summaries between iterations — only write a ```js code block OR a standalone SUBMIT() call, not both, not neither.")
   lines.push("- Do NOT repeat the same failing code. If something fails twice, change your approach.")
   lines.push("")
@@ -271,6 +346,7 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     lines.push("## Recursive Sub-calls")
     lines.push("`const result = await llm_query(query, context?)` — delegate semantic analysis to a sub-LLM. Returns a string.")
     lines.push("`const result = await llm_query(query, context?, { model: \"name\" })` — route a sub-call to a named model.")
+    lines.push("`const result = await llm_query(query, context?, { responseFormat: { type: \"json\", schema: {...} } })` — request structured JSON output. Returns a parsed object, not a string.")
     lines.push("`const results = await llm_query_batched(queries, contexts?)` — run multiple independent semantic sub-calls in parallel. Returns a string array in input order.")
     if (options.mediaNames !== undefined && options.mediaNames.length > 0) {
       lines.push("`const result = await llm_query_with_media(prompt, ...mediaNames)` — multimodal sub-call using registered media attachments.")
@@ -292,6 +368,40 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
       lines.push(`- Available media names: ${options.mediaNames.join(", ")}`)
     }
     lines.push("")
+    lines.push("### Structured Output (responseFormat)")
+    lines.push("When extracting structured data, prefer `responseFormat` over asking for delimited text:")
+    lines.push("```js")
+    lines.push("const result = await llm_query('Extract actors', articleText, {")
+    lines.push("  responseFormat: {")
+    lines.push("    type: 'json',")
+    lines.push("    schema: {")
+    lines.push("      type: 'object',")
+    lines.push("      properties: {")
+    lines.push("        actors: { type: 'array', items: { type: 'object',")
+    lines.push("          properties: { name: { type: 'string' }, role: { type: 'string' } },")
+    lines.push("          required: ['name', 'role'] } }")
+    lines.push("      },")
+    lines.push("      required: ['actors']")
+    lines.push("    }")
+    lines.push("  }")
+    lines.push("})")
+    lines.push("// result is a parsed object: { actors: [{ name: 'Alice', role: 'researcher' }] }")
+    lines.push("```")
+    lines.push("- Returns a parsed JavaScript object, not a string — no need for JSON.parse.")
+    lines.push("- Schema uses JSON Schema format (object, array, string, number, boolean, null, enum, required).")
+    lines.push("- If the model returns invalid JSON or schema mismatch, the call will fail with an error (can be caught with try/catch).")
+    lines.push("")
+    if (options.depth < options.maxDepth - 1) {
+      lines.push("### Recursive Sub-Calls (depth > 1)")
+      lines.push("Your `llm_query()` calls spawn full recursive sub-calls with their own REPL and")
+      lines.push("iteration loop. Use this for sub-problems that need:")
+      lines.push("- Multi-step exploration of a subset")
+      lines.push("- Their own code-based filtering or transformation")
+      lines.push("- Iterative refinement before producing a result")
+      lines.push("")
+      lines.push("For simple extraction/classification, prefer `llm_query_batched` (one-shot, parallel).")
+      lines.push("")
+    }
     lines.push("### Use llm_query() for:")
     lines.push("- Summarization or paraphrasing")
     lines.push("- Classification or categorization (topic, stance, sentiment)")
@@ -305,11 +415,42 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     lines.push("- Sorting, filtering, deduplication")
     lines.push("- Parsing and data transformation")
     lines.push("")
-    lines.push("### Budget-aware chunking strategy")
-    lines.push("1. Inspect data size and shape with code.")
-    lines.push("2. Compute chunk size from available LLM-call budget.")
-    lines.push("3. Analyze each chunk with `llm_query_batched` or `Promise.all` over `llm_query`.")
-    lines.push("4. Aggregate with code or one final llm_query().")
+    lines.push("### Recursive Decomposition for Large Datasets (100+ records)")
+    lines.push("RLM's power is model-driven decomposition: you observe the data, decide how to")
+    lines.push("partition, then process. This is more powerful than fixed map-reduce because you")
+    lines.push("can peek, filter, and adapt before committing to a strategy.")
+    lines.push("")
+    lines.push("**The Pattern: Explore → Filter → Decompose → Process → Aggregate**")
+    lines.push("1. EXPLORE: Peek at data structure, schema, size, field distributions.")
+    lines.push("2. FILTER: Narrow programmatically using code (field matching, regex, keyword). This is instant and more precise than search.")
+    lines.push("3. DECOMPOSE: Based on what you observed, decide partitioning — by time period? By category? By size? How many per batch? (compute from budget)")
+    lines.push("4. PROCESS: Use `llm_query_batched` for independent chunks. Each sub-call is a one-shot LLM call — keep prompts focused. Request structured JSON output for easier aggregation.")
+    lines.push("5. AGGREGATE: Merge results with code (counts, dedup, frequency analysis).")
+    lines.push("6. SYNTHESIZE: Final `llm_query` for cross-document insights if needed.")
+    lines.push("")
+    lines.push("**Coverage Calculation** (do this in your plan):")
+    lines.push("```js")
+    lines.push("const b = await budget()")
+    lines.push("const perBatch = 15  // articles per llm_query_batched call")
+    lines.push("const needed = Math.ceil(candidates.length / perBatch)")
+    lines.push("const available = Math.floor(b.llmCallsRemaining * 0.6)")
+    lines.push("print(`Coverage: ${needed <= available ? 'FULL' : 'SAMPLE'} — need ${needed}, have ${available}`)")
+    lines.push("```")
+    lines.push("")
+    lines.push("**Budget Allocation:**")
+    lines.push("  10% iterations: explore + plan")
+    lines.push("  60% iterations: extract/process")
+    lines.push("  20% iterations: synthesize + verify")
+    lines.push("  10% iterations: reserve for errors")
+    lines.push("")
+    lines.push("**Sub-Call Behavior:**")
+    lines.push("At the default depth setting, `llm_query()` calls are ONE-SHOT: a single LLM")
+    lines.push("generation with up to ~500K chars of context. They do NOT get their own REPL")
+    lines.push("or iteration loop. This means:")
+    lines.push("- Keep sub-call prompts focused on a single task.")
+    lines.push("- Pass context as the second argument, not embedded in the query string.")
+    lines.push("- Request structured output (JSON) for easier aggregation.")
+    lines.push("- Use `llm_query_batched` for independent chunks (runs in parallel).")
     lines.push("")
     lines.push("### Error recovery patterns")
     lines.push("- Failed llm_query: wrap in try/catch and fall back — `.catch(e => { print('retry: ' + e.message); return fallback })`")
@@ -558,9 +699,11 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
           lines.push("  - `init_corpus(documents, options?)` — batch-learn an array of documents and set `__vars.contextCorpusId`.")
           lines.push("  - `init_corpus_from_context(options?)` — parse `__vars.context` via `__vars.contextMeta`, learn corpus, and set `__vars.contextCorpusId`.")
         }
-        lines.push("- Document shape: `{ text: string, id?: string }` — also accepts objects with `content`, `body`, or `description` fields.")
+        lines.push("- Document shape: `{ text: string, id?: string }` — also accepts objects with `content`, `body`, `body_markdown`, or `description` fields.")
+        lines.push("- Override text field detection: pass `{ textField: \"fieldName\" }` to `init_corpus` or `init_corpus_from_context`.")
         lines.push("- Batch size: ~500 documents per LearnCorpus call. For larger datasets, loop in batches.")
         pushNlpToolLine(lines, "QueryCorpus", "- QueryCorpus scores: BM25 relevance, higher = more relevant. Pass `includeText: true` to get full text in results.")
+        lines.push("- ⚠️ BM25 performance degrades significantly on documents >2,000 words. If the dataset has metadata fields (topics, categories, tags), use code filtering FIRST. Only fall back to corpus search if no suitable metadata fields exist. If BM25 top scores < 0.1, abandon corpus search and switch to code filtering.")
         if (availableToolNames.has("RankByRelevance")) {
           lines.push("- Decision tree: QueryCorpus for >50 records with repeated queries; RankByRelevance for <10K one-shot ranking; code filtering for exact field matching.")
         }
@@ -593,8 +736,11 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
     lines.push("")
   }
 
-  lines.push("## Budget")
-  lines.push(`Iteration ${options.iteration} of ${options.maxIterations}. ` +
+  lines.push("## Budget (current snapshot — call `budget()` in code for live values)")
+  const phase = options.iteration <= 2 ? "EXPLORE/PLAN"
+    : options.iteration <= Math.floor(options.maxIterations * 0.8) ? "EXECUTE"
+    : "SYNTHESIZE/SUBMIT"
+  lines.push(`Iteration ${options.iteration} of ${options.maxIterations}. Phase: ${phase}. ` +
     `Iterations remaining: ${options.budget.iterationsRemaining}. ` +
     `LLM calls remaining: ${options.budget.llmCallsRemaining}.`)
   if (options.budget.tokenBudgetRemaining !== undefined) {
@@ -637,3 +783,14 @@ export const buildExtractSystemPrompt = (outputJsonSchema?: object): string => {
 
 export const buildOneShotSystemPrompt = (): string =>
   "Answer the query directly and concisely. Do not use code blocks, SUBMIT(), or any special formatting. Return your answer as plain text."
+
+export const buildOneShotJsonSystemPrompt = (schema: object): string => {
+  const lines: Array<string> = []
+  lines.push("You must respond with ONLY a valid JSON object or array matching the schema below.")
+  lines.push("Do not include any text before or after the JSON. Do not use markdown code fences.")
+  lines.push("Do not include explanations, comments, or any non-JSON content.")
+  lines.push("")
+  lines.push("Required JSON Schema:")
+  lines.push(JSON.stringify(schema, null, 2))
+  return lines.join("\n")
+}

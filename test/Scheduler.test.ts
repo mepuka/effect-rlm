@@ -1596,4 +1596,214 @@ describe("Scheduler tool dispatch (e2e with real sandbox)", () => {
     expect(firstUserText).toContain("Format: CSV")
     expect(firstUserText).toContain("Fields: id, name")
   }, 15_000)
+
+  test("llm_query with responseFormat returns parsed JSON object via one-shot path", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      isSubCalls: []
+    }
+
+    const answer = await Effect.runPromise(
+      complete({
+        query: "structured output test",
+        context: "ctx"
+      }).pipe(
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\nconst result = await llm_query('Extract actors', 'Alice is a researcher', { responseFormat: { type: 'json', schema: { type: 'object', properties: { actors: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } } }, required: ['actors'] } } })\n__vars.extracted = result\nprint(typeof result)\n```" },
+            { text: '{"actors": [{"name": "Alice"}]}' },
+            submitAnswer("done")
+          ],
+          modelMetrics,
+          config: { maxDepth: 0 }
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    expect(answer).toBe("done")
+    // The sub-call (second model call) should use the JSON system prompt
+    const subCallPrompt = modelMetrics.prompts[1]!
+    const systemMessages = subCallPrompt.content.filter((m) => m.role === "system")
+    const systemText = systemMessages.map((m) =>
+      m.role === "system"
+        ? (typeof m.content === "string" ? m.content : (m.content as ReadonlyArray<{ readonly text: string }>)[0]?.text ?? "")
+        : ""
+    ).join(" ")
+    expect(systemText).toContain("Required JSON Schema")
+    expect(systemText).toContain("valid JSON")
+    // The sub-call should be marked as a sub-call at depth 1
+    expect(modelMetrics.isSubCalls?.[1]).toBe(true)
+    expect(modelMetrics.depths[1]).toBe(1)
+  }, 15_000)
+
+  test("llm_query with responseFormat rejects malformed JSON from model", async () => {
+    const events = await Effect.runPromise(
+      stream({
+        query: "bad json test",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.map(Chunk.toArray),
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\ntry {\n  const result = await llm_query('Extract', 'data', { responseFormat: { type: 'json', schema: { type: 'object', properties: { x: { type: 'number' } }, required: ['x'] } } })\n  print('got: ' + JSON.stringify(result))\n} catch (e) {\n  print('error: ' + e.message)\n}\n```" },
+            { text: "This is not valid JSON at all" },
+            { text: "This is still not valid JSON" },
+            submitAnswer("handled")
+          ],
+          config: { maxDepth: 0 }
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    const execCompleted = events.find(
+      (event) => event._tag === "CodeExecutionCompleted"
+    ) as { _tag: "CodeExecutionCompleted"; output: string } | undefined
+    expect(execCompleted).toBeDefined()
+    expect(execCompleted!.output).toContain("error:")
+    expect(execCompleted!.output).toContain("Failed to parse JSON")
+  }, 15_000)
+
+  test("llm_query with responseFormat rejects schema validation failures", async () => {
+    const events = await Effect.runPromise(
+      stream({
+        query: "schema mismatch test",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.map(Chunk.toArray),
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\ntry {\n  const result = await llm_query('Extract', 'data', { responseFormat: { type: 'json', schema: { type: 'object', properties: { count: { type: 'number' } }, required: ['count'] } } })\n  print('got: ' + JSON.stringify(result))\n} catch (e) {\n  print('error: ' + e.message)\n}\n```" },
+            { text: '{"name": "Alice"}' },
+            { text: '{"name": "Alice again"}' },
+            submitAnswer("handled")
+          ],
+          config: { maxDepth: 0 }
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    const execCompleted = events.find(
+      (event) => event._tag === "CodeExecutionCompleted"
+    ) as { _tag: "CodeExecutionCompleted"; output: string } | undefined
+    expect(execCompleted).toBeDefined()
+    expect(execCompleted!.output).toContain("error:")
+    expect(execCompleted!.output).toContain("schema validation failed")
+  }, 15_000)
+
+  test("llm_query with invalid responseFormat option rejects before model call", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      isSubCalls: []
+    }
+
+    const events = await Effect.runPromise(
+      stream({
+        query: "invalid format test",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.map(Chunk.toArray),
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            { text: "```js\ntry {\n  const result = await llm_query('Extract', 'data', { responseFormat: { type: 'xml' } })\n  print('got: ' + result)\n} catch (e) {\n  print('error: ' + e.message)\n}\n```" },
+            submitAnswer("handled")
+          ],
+          modelMetrics,
+          config: { maxDepth: 0 }
+        })),
+        Effect.timeout("10 seconds")
+      )
+    )
+
+    const execCompleted = events.find(
+      (event) => event._tag === "CodeExecutionCompleted"
+    ) as { _tag: "CodeExecutionCompleted"; output: string } | undefined
+    expect(execCompleted).toBeDefined()
+    expect(execCompleted!.output).toContain("error:")
+    expect(execCompleted!.output).toContain("responseFormat")
+    // Only 2 model calls: the main REPL iteration + the final SUBMIT, no sub-call
+    expect(modelMetrics.calls).toBe(2)
+  }, 15_000)
+
+  test("recursive sub-call with responseFormat validates output against schema", async () => {
+    const events = await Effect.runPromise(
+      stream({
+        query: "recursive schema validation test",
+        context: "ctx"
+      }).pipe(
+        Stream.runCollect,
+        Effect.map(Chunk.toArray),
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            // Root call: code with llm_query + responseFormat requiring { count: number }
+            { text: "```js\ntry {\n  const result = await llm_query('Extract count', 'data', { responseFormat: { type: 'json', schema: { type: 'object', properties: { count: { type: 'number' } }, required: ['count'] } } })\n  print('got: ' + JSON.stringify(result))\n} catch (e) {\n  print('error: ' + e.message)\n}\n```" },
+            // Sub-call iter 1: sets a mismatched value (string instead of number for count)
+            { text: "```js\n__vars.result = { name: 'Alice' }\n```" },
+            // Sub-call iter 2: SUBMIT with the wrong-schema value
+            { toolCalls: [{ name: "SUBMIT", params: { variable: "result" } }] },
+            // Root call iter 2: sees the error, submits
+            submitAnswer("handled")
+          ],
+          config: { maxDepth: 2 }
+        })),
+        Effect.timeout("15 seconds")
+      )
+    )
+
+    // The root call's code execution should receive the schema validation error
+    // via the rejected llm_query bridge promise
+    const execEvents = events.filter(
+      (event) => event._tag === "CodeExecutionCompleted"
+    ) as Array<{ _tag: "CodeExecutionCompleted"; output: string; callId: string }>
+    // Find the root call execution (not sub-call)
+    const rootExec = execEvents.find((e) => e.callId === "root")
+    expect(rootExec).toBeDefined()
+    expect(rootExec!.output).toContain("error:")
+    expect(rootExec!.output).toContain("schema validation failed")
+  }, 20_000)
+
+  test("recursive sub-call with responseFormat passes outputJsonSchema to child call", async () => {
+    const modelMetrics: FakeModelMetrics = {
+      calls: 0,
+      prompts: [],
+      depths: [],
+      isSubCalls: []
+    }
+
+    const answer = await Effect.runPromise(
+      complete({
+        query: "recursive structured test",
+        context: "ctx"
+      }).pipe(
+        Effect.provide(makeRealSandboxLayers({
+          responses: [
+            // Root call, iter 1: code with llm_query that has responseFormat
+            { text: "```js\nconst result = await llm_query('Extract actors', 'Alice is a researcher', { responseFormat: { type: 'json', schema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] } } })\n__vars.result = result\nprint(JSON.stringify(result))\n```" },
+            // Sub-call at depth 1, iter 1: code that sets a var
+            { text: "```js\n__vars.result = { name: 'Alice' }\n```" },
+            // Sub-call at depth 1, iter 2: SUBMIT tool call to finalize
+            { toolCalls: [{ name: "SUBMIT", params: { variable: "result" } }] },
+            // Root call, iter 2: sees "{ name: 'Alice' }" printed, submit answer
+            submitAnswer("done")
+          ],
+          modelMetrics,
+          config: { maxDepth: 2 }
+        })),
+        Effect.timeout("15 seconds")
+      )
+    )
+
+    expect(answer).toBe("done")
+    // Sub-call should have been started recursively (not one-shot) at depth 1
+    expect(modelMetrics.depths.some((d) => d === 1)).toBe(true)
+  }, 20_000)
 })

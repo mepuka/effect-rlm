@@ -147,11 +147,25 @@ const buildSnapshotKey = (snapshot: TraceVarSnapshot): string => {
   return `call-${callId}.depth-${depth}.iter-${iteration}.json`
 }
 
+const MANIFEST_KEY = "__trace_manifest__"
+
 const buildSnapshotPayload = (
   snapshot: TraceVarSnapshot,
   maxSnapshotBytes: number
 ): string => {
-  const sorted = Object.entries(snapshot.vars).sort(([a], [b]) => a.localeCompare(b))
+  // Compute serialized sizes and sort ascending so small diagnostic vars always appear
+  const entries = Object.entries(snapshot.vars).map(([name, rawValue]) => {
+    const serialized = safeJsonStringify(normalizeUnknown(rawValue))
+    return { name, rawValue, serializedSize: byteLength(serialized) }
+  })
+  entries.sort((a, b) => a.serializedSize - b.serializedSize)
+
+  // Build manifest (all variable names + sizes, always included)
+  const manifest: Record<string, number> = {}
+  for (const entry of entries) {
+    manifest[entry.name] = entry.serializedSize
+  }
+
   const vars: Record<string, unknown> = {}
   const base = {
     callId: snapshot.callId,
@@ -160,13 +174,13 @@ const buildSnapshotPayload = (
   }
 
   let truncated = false
-  for (const [name, rawValue] of sorted) {
-    vars[name] = normalizeUnknown(rawValue)
-    const candidate = safeJsonStringify({ ...base, vars })
+  for (const entry of entries) {
+    vars[entry.name] = normalizeUnknown(entry.rawValue)
+    const candidate = safeJsonStringify({ ...base, vars, [MANIFEST_KEY]: manifest })
     if (byteLength(candidate) > maxSnapshotBytes) {
-      delete vars[name]
+      delete vars[entry.name]
       truncated = true
-      break
+      // Continue to try remaining smaller entries (already sorted ascending)
     }
   }
 
@@ -174,7 +188,18 @@ const buildSnapshotPayload = (
     vars[TRUNCATED_SENTINEL_KEY] = `Snapshot exceeded ${maxSnapshotBytes} bytes`
   }
 
-  let payload = safeJsonStringify({ ...base, vars })
+  let payload = safeJsonStringify({ ...base, vars, [MANIFEST_KEY]: manifest })
+  if (byteLength(payload) > maxSnapshotBytes) {
+    payload = safeJsonStringify({
+      ...base,
+      vars: {
+        [TRUNCATED_SENTINEL_KEY]: `Snapshot exceeded ${maxSnapshotBytes} bytes`
+      },
+      [MANIFEST_KEY]: manifest
+    })
+  }
+
+  // Final safety check — if manifest itself is too large, drop it
   if (byteLength(payload) > maxSnapshotBytes) {
     payload = safeJsonStringify({
       ...base,

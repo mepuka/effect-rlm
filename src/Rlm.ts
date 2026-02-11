@@ -21,6 +21,7 @@ export interface CompleteOptionsBase {
   readonly query: string
   readonly context: string
   readonly contextMetadata?: ContextMetadata
+  readonly contextTextField?: string
   readonly mediaAttachments?: RunSchedulerOptions["mediaAttachments"]
   readonly depth?: number
   readonly tools?: ReadonlyArray<RlmToolAny>
@@ -51,6 +52,9 @@ const toSchedulerOptions = (options: CompleteOptionsBase & { readonly outputSche
   context: options.context,
   ...(options.contextMetadata !== undefined
     ? { contextMetadata: options.contextMetadata }
+    : {}),
+  ...(options.contextTextField !== undefined
+    ? { contextTextField: options.contextTextField }
     : {}),
   ...(options.mediaAttachments !== undefined && options.mediaAttachments.length > 0
     ? { mediaAttachments: options.mediaAttachments }

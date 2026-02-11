@@ -92,7 +92,7 @@ const STRICT_BLOCKLIST: ReadonlyArray<{
 const makeStrictScope = (
   print: (...args: unknown[]) => void,
   __vars: unknown,
-  llm_query: (query: string, context?: string, options?: { model?: string }) => Promise<unknown>,
+  llm_query: (query: string, context?: string, options?: { model?: string; responseFormat?: { type: string; schema: object } }) => Promise<unknown>,
   llm_query_batched: (queries: ReadonlyArray<string>, contexts?: ReadonlyArray<string>) => Promise<unknown>,
   llm_query_with_media: (query: string, ...mediaNames: ReadonlyArray<string>) => Promise<unknown>,
   budget: () => Promise<unknown>,
@@ -280,15 +280,15 @@ async function executeCode(
 
   const llm_query = async (
     query: string,
-    contextOrOptions?: string | { model?: string },
-    optionsArg?: { model?: string }
+    contextOrOptions?: string | { model?: string; responseFormat?: { type: string; schema: object } },
+    optionsArg?: { model?: string; responseFormat?: { type: string; schema: object } }
   ): Promise<unknown> => {
     if (sandboxMode === "strict") {
       throw new Error("Bridge disabled in strict sandbox mode")
     }
 
     let context: string | undefined
-    let options: { model?: string } | undefined
+    let options: { model?: string; responseFormat?: { type: string; schema: object } } | undefined
     if (typeof contextOrOptions === "string") {
       context = contextOrOptions
       options = optionsArg
@@ -416,7 +416,7 @@ async function executeCode(
       if (typeof explicit === "string") return explicit
     }
 
-    const candidateFields = ["text", "content", "body", "message", "summary", "title"]
+    const candidateFields = ["text", "content", "body", "body_markdown", "body_text", "body_html", "markdown", "message", "description", "summary", "title"]
     for (const field of candidateFields) {
       const value = record[field]
       if (typeof value === "string") return value
@@ -567,6 +567,17 @@ async function executeCode(
     const contextMeta = toObject(vars.get("contextMeta"))
     const format = toNonEmptyString(contextMeta.format)
 
+    // textField precedence: explicit option > API-level contextTextField > auto-detected primaryTextField
+    if (normalizedOptions.textField === undefined) {
+      const contextTextField = toNonEmptyString(contextMeta.contextTextField)
+      const primaryTextField = toNonEmptyString(contextMeta.primaryTextField)
+      if (contextTextField !== undefined) {
+        normalizedOptions.textField = contextTextField
+      } else if (primaryTextField !== undefined) {
+        normalizedOptions.textField = primaryTextField
+      }
+    }
+
     let sourceDocuments: Array<unknown> = []
 
     if (format === "ndjson") {
@@ -704,10 +715,18 @@ async function executeCode(
     })
   } catch (err: unknown) {
     const error = err instanceof Error ? err : new Error(String(err))
+    let message = error.message
+    if (err instanceof ReferenceError) {
+      const match = message.match(/^(\w+) is not defined$/)
+      const varName = match?.[1]
+      if (varName !== undefined && !vars.has(varName)) {
+        message += `\nHint: Each iteration runs in a fresh scope. If \`${varName}\` came from a prior iteration, persist it as \`__vars.${varName}\` instead.`
+      }
+    }
     emitFrame({
       _tag: "ExecError",
       requestId,
-      message: error.message,
+      message,
       stack: error.stack
     })
   }

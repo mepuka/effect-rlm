@@ -31,7 +31,8 @@ import {
   buildExtractPrompt,
   truncateExecutionOutput
 } from "./RlmPrompt"
-import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildExtractSystemPrompt } from "./SystemPrompt"
+import { buildReplSystemPrompt, buildOneShotSystemPrompt, buildOneShotJsonSystemPrompt, buildExtractSystemPrompt } from "./SystemPrompt"
+import { parseAndValidateJson, validateJsonSchema } from "./JsonSchemaValidator"
 import {
   buildSubmitToolkit,
   extractSubmitAnswer,
@@ -65,6 +66,7 @@ export interface RunSchedulerOptions {
   readonly query: string
   readonly context: string
   readonly contextMetadata?: ContextMetadata
+  readonly contextTextField?: string
   readonly mediaAttachments?: ReadonlyArray<MediaAttachment>
   readonly depth?: number
   readonly rootCallId?: CallId
@@ -399,6 +401,9 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
           query: command.query
         })
         if (contextMetadata !== undefined) {
+          const resolvedContextTextField = command.callId === rootCallId
+            ? options.contextTextField
+            : undefined
           yield* vars.inject("contextMeta", {
             ...(contextMetadata.fileName !== undefined
               ? { fileName: contextMetadata.fileName }
@@ -414,6 +419,12 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
               : {}),
             ...(contextMetadata.sampleRecord !== undefined
               ? { sampleRecord: contextMetadata.sampleRecord }
+              : {}),
+            ...(contextMetadata.primaryTextField !== undefined
+              ? { primaryTextField: contextMetadata.primaryTextField }
+              : {}),
+            ...(resolvedContextTextField !== undefined
+              ? { contextTextField: resolvedContextTextField }
               : {})
           })
         }
@@ -899,17 +910,22 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         readonly depth: number
         readonly namedModel?: string
         readonly media?: ReadonlyArray<MediaAttachment>
+        readonly responseFormat?: { readonly type: string; readonly schema: object }
       }) =>
         Effect.gen(function*() {
+          const systemPrompt = options.responseFormat !== undefined
+            ? buildOneShotJsonSystemPrompt(options.responseFormat.schema)
+            : buildOneShotSystemPrompt()
+
           const oneShotPrompt = options.media !== undefined && options.media.length > 0
             ? buildOneShotPromptWithMedia({
-                systemPrompt: buildOneShotSystemPrompt(),
+                systemPrompt,
                 query: options.query,
                 media: options.media,
                 enablePromptCaching: config.enablePromptCaching
               })
             : buildOneShotPrompt({
-                systemPrompt: buildOneShotSystemPrompt(),
+                systemPrompt,
                 query: options.query,
                 context: options.context,
                 enablePromptCaching: config.enablePromptCaching
@@ -925,6 +941,10 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
             })
           )
           yield* recordTokens(command.callId, response.usage.totalTokens)
+
+          if (options.responseFormat !== undefined) {
+            return parseAndValidateJson(response.text, options.responseFormat.schema)
+          }
           return response.text
         }).pipe(
           Effect.retry(bridgeLlmQueryRetryPolicy)
@@ -1169,7 +1189,7 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         )
         return
       }
-      const llmOptions = llmOptionsArg as { readonly model?: unknown } | undefined
+      const llmOptions = llmOptionsArg as { readonly model?: unknown; readonly responseFormat?: unknown } | undefined
       const namedModel = llmOptions?.model
       if (namedModel !== undefined && typeof namedModel !== "string") {
         yield* failBridgeDeferred(
@@ -1179,17 +1199,37 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         return
       }
 
+      // Parse responseFormat option
+      let responseFormat: { readonly type: string; readonly schema: object } | undefined
+      if (llmOptions?.responseFormat !== undefined) {
+        const rf = llmOptions.responseFormat
+        if (
+          typeof rf !== "object" || rf === null || Array.isArray(rf) ||
+          !("type" in rf) || (rf as { type: unknown }).type !== "json" ||
+          !("schema" in rf) || typeof (rf as { schema: unknown }).schema !== "object" ||
+          (rf as { schema: unknown }).schema === null
+        ) {
+          yield* failBridgeDeferred(
+            command.bridgeRequestId,
+            "llm_query options.responseFormat must be { type: \"json\", schema: <object> }"
+          )
+          return
+        }
+        responseFormat = { type: "json", schema: (rf as { schema: object }).schema }
+      }
+
       if (callState.depth + 1 >= config.maxDepth || namedModel !== undefined) {
         // At max depth: one-shot model call (no REPL protocol) with budget reservation
         yield* Effect.forkIn(
           Effect.gen(function*() {
-            const oneShotResponseText = yield* runOneShotSubCall({
+            const oneShotResult = yield* runOneShotSubCall({
               query: llmQueryArg,
               context: llmContextArg ?? "",
               depth: callState.depth + 1,
-              ...(namedModel !== undefined ? { namedModel } : {})
+              ...(namedModel !== undefined ? { namedModel } : {}),
+              ...(responseFormat !== undefined ? { responseFormat } : {})
             })
-            yield* resolveBridgeDeferred(command.bridgeRequestId, oneShotResponseText)
+            yield* resolveBridgeDeferred(command.bridgeRequestId, oneShotResult)
           }).pipe(
             Effect.catchAllCause((cause) => {
               const message = Cause.isFailType(cause)
@@ -1209,7 +1249,8 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
             depth: callState.depth + 1,
             query: llmQueryArg,
             context: llmContextArg ?? "",
-            parentBridgeRequestId: command.bridgeRequestId
+            parentBridgeRequestId: command.bridgeRequestId,
+            ...(responseFormat !== undefined ? { outputJsonSchema: responseFormat.schema } : {})
           }))
         )
         if (Exit.isFailure(enqueueExit)) {
@@ -1251,6 +1292,24 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
         // Sub-call completing → resolve bridge deferred
         if (command.payload.source === "answer") {
           yield* resolveBridgeDeferred(callState.parentBridgeRequestId, command.payload.answer)
+          return
+        }
+        if (command.payload.source === "value") {
+          // Validate against outputJsonSchema if present (recursive responseFormat path)
+          if (callState.outputJsonSchema !== undefined) {
+            const validationResult = validateJsonSchema(command.payload.value, callState.outputJsonSchema)
+            if (!validationResult.valid) {
+              yield* failBridgeDeferred(
+                callState.parentBridgeRequestId,
+                new OutputValidationError({
+                  message: `Sub-call structured output schema validation failed: ${validationResult.errors.join("; ")}`,
+                  raw: renderedAnswer
+                })
+              )
+              return
+            }
+          }
+          yield* resolveBridgeDeferred(callState.parentBridgeRequestId, command.payload.value)
           return
         }
 
