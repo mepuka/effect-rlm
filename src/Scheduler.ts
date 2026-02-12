@@ -292,8 +292,11 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
   ) =>
     Effect.gen(function*() {
       const transcript = yield* readTranscript(callState)
+      const vars = makeCallVariableSpace(callState)
+      const cached = yield* vars.cached
+      const varNames = cached.variables.map(v => v.name)
       const extractPrompt = buildExtractPrompt({
-        systemPrompt: buildExtractSystemPrompt(callState.outputJsonSchema),
+        systemPrompt: buildExtractSystemPrompt(callState.outputJsonSchema, varNames),
         query: callState.query,
         ...(callState.contextMetadata !== undefined || callState.context.length > 0
           ? { contextMetadata: callState.contextMetadata ?? analyzeContext(callState.context) }
@@ -593,6 +596,7 @@ const runSchedulerInternal = Effect.fn("Scheduler.runInternal")(function*(option
           ...(callState.contextMetadata !== undefined
             ? { contextMetadata: callState.contextMetadata }
             : {}),
+          maxFrameBytes: sandboxConfig.maxFrameBytes,
           sandboxMode: sandboxConfig.sandboxMode,
           ...(config.subModelContextChars !== undefined
             ? { subModelContextChars: config.subModelContextChars }

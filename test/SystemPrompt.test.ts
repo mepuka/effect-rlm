@@ -806,6 +806,45 @@ describe("SystemPrompt", () => {
     const prompt = buildReplSystemPrompt({ ...baseOptions, depth: 0, maxDepth: 1 })
     expect(prompt).not.toContain("### Budget-aware chunking strategy")
   })
+
+  test("REPL prompt includes dynamic frame limit when maxFrameBytes provided", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      maxFrameBytes: 32 * 1024 * 1024
+    })
+    expect(prompt).toContain("~32MB")
+    expect(prompt).toContain("split across multiple variables")
+  })
+
+  test("REPL prompt shows KB for sub-MB maxFrameBytes", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      maxFrameBytes: 512 * 1024
+    })
+    expect(prompt).toContain("~512KB")
+    expect(prompt).not.toContain("~0MB")
+  })
+
+  test("REPL prompt clamps sub-KB maxFrameBytes to 1KB", () => {
+    const prompt = buildReplSystemPrompt({
+      ...baseOptions,
+      maxFrameBytes: 128
+    })
+    expect(prompt).toContain("~1KB")
+    expect(prompt).not.toContain("~0KB")
+  })
+
+  test("REPL prompt omits frame limit when maxFrameBytes not provided", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).not.toContain("cannot exceed")
+  })
+
+  test("REPL prompt includes size threshold guidance for variable-based SUBMIT", () => {
+    const prompt = buildReplSystemPrompt(baseOptions)
+    expect(prompt).toContain("50KB")
+    expect(prompt).toContain("500 lines")
+    expect(prompt).toContain("prefer `SUBMIT({ variable:")
+  })
 })
 
 describe("buildExtractSystemPrompt", () => {
@@ -835,6 +874,51 @@ describe("buildExtractSystemPrompt", () => {
   test("omits schema section when not provided", () => {
     const prompt = buildExtractSystemPrompt()
     expect(prompt).not.toContain("valid JSON matching this schema")
+  })
+
+  test("extract prompt includes PREFER for variable refs", () => {
+    const prompt = buildExtractSystemPrompt()
+    expect(prompt).toContain("PREFER")
+    expect(prompt).toContain("avoids generating a large answer inline")
+  })
+
+  test("extract prompt includes available variable names when provided", () => {
+    const prompt = buildExtractSystemPrompt(undefined, ["results", "context", "summary"])
+    expect(prompt).toContain("`results`")
+    expect(prompt).toContain("`summary`")
+    expect(prompt).not.toContain("`context`")
+  })
+
+  test("extract prompt sanitizes variable names with backticks and newlines", () => {
+    const prompt = buildExtractSystemPrompt(undefined, ["good", "has`tick", "new\nline", "ok"])
+    expect(prompt).toContain("`good`")
+    expect(prompt).toContain("`ok`")
+    expect(prompt).toContain("`hastick`")
+    expect(prompt).toContain("`newline`")
+    // No raw backticks or newlines from injected names
+    expect(prompt).not.toContain("has`tick")
+    expect(prompt).not.toContain("new\nline")
+  })
+
+  test("extract prompt drops empty or overly long variable names", () => {
+    const longName = "a".repeat(200)
+    const prompt = buildExtractSystemPrompt(undefined, ["valid", "", longName])
+    expect(prompt).toContain("`valid`")
+    expect(prompt).not.toContain(longName)
+  })
+
+  test("extract prompt caps variable list at 50 entries", () => {
+    const names = Array.from({ length: 80 }, (_, i) => `var${i}`)
+    const prompt = buildExtractSystemPrompt(undefined, names)
+    expect(prompt).toContain("`var0`")
+    expect(prompt).toContain("`var49`")
+    expect(prompt).not.toContain("`var50`")
+    expect(prompt).toContain("(and 30 more)")
+  })
+
+  test("extract prompt omits variable list when only system variables present", () => {
+    const prompt = buildExtractSystemPrompt(undefined, ["context", "contextMeta", "query"])
+    expect(prompt).not.toContain("Available variables")
   })
 })
 

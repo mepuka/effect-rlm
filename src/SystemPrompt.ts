@@ -27,6 +27,7 @@ export interface ReplSystemPromptOptions {
   readonly mediaNames?: ReadonlyArray<string>
   readonly tools?: ReadonlyArray<ToolDescriptor>
   readonly outputJsonSchema?: object
+  readonly maxFrameBytes?: number
   readonly sandboxMode?: "permissive" | "strict"
   readonly subModelContextChars?: number
   readonly contextMetadata?: ContextMetadata
@@ -188,6 +189,12 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   lines.push("delete __vars.rawExtractions // don't carry forward parsed intermediates")
   lines.push("```")
   lines.push("Large `__vars` waste context tokens. Keep only what you need for remaining iterations.")
+  if (options.maxFrameBytes !== undefined) {
+    const limitLabel = options.maxFrameBytes >= 1024 * 1024
+      ? `${Math.floor(options.maxFrameBytes / (1024 * 1024))}MB`
+      : `${Math.max(1, Math.floor(options.maxFrameBytes / 1024))}KB`
+    lines.push(`Individual \`__vars\` entries cannot exceed ~${limitLabel} when serialized. For very large datasets, split across multiple variables or aggregate before submission.`)
+  }
   lines.push("")
   lines.push("## Strategy")
   lines.push("You have multiple iterations. Use them. Do NOT try to finish everything in one step.")
@@ -286,6 +293,7 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   }
   lines.push("- Use exactly one field in SUBMIT. Do NOT combine fields.")
   lines.push("- For very large final outputs, store the result in `__vars` and submit with `variable` to avoid output truncation.")
+  lines.push("  If your final result exceeds ~500 lines or ~50KB when serialized, prefer `SUBMIT({ variable: \"name\" })` over inline submission.")
   lines.push("- Do NOT call SUBMIT until you have seen execution output confirming your results. SUBMIT ends execution immediately — there is no next iteration.")
   lines.push("- Do NOT include SUBMIT() inside a ```js code block — it is a standalone tool call, not a function.")
   lines.push("- Do NOT call SUBMIT on the first iteration. You must explore the data first.")
@@ -757,7 +765,7 @@ export const buildReplSystemPrompt = (options: ReplSystemPromptOptions): string 
   return lines.join("\n")
 }
 
-export const buildExtractSystemPrompt = (outputJsonSchema?: object): string => {
+export const buildExtractSystemPrompt = (outputJsonSchema?: object, variableNames?: ReadonlyArray<string>): string => {
   const submitInvocationSchema = buildSubmitInvocationSchema(outputJsonSchema)
   const lines: Array<string> = []
   lines.push("You ran out of iterations. Based on the work done so far, provide your best answer now.")
@@ -765,7 +773,18 @@ export const buildExtractSystemPrompt = (outputJsonSchema?: object): string => {
   lines.push("Review the conversation above and extract the final answer to the original query.")
   lines.push("You MUST finalize using exactly one SUBMIT tool call.")
   lines.push("Do NOT output code blocks or commentary.")
-  lines.push("If your best final output already exists in `__vars`, you may finalize via `SUBMIT({ variable: \"name\" })`.")
+  lines.push("PREFER `SUBMIT({ variable: \"name\" })` if your result already exists in `__vars` — this avoids generating a large answer inline and is faster.")
+  if (variableNames !== undefined && variableNames.length > 0) {
+    const filtered = variableNames
+      .filter(n => n !== "context" && n !== "contextMeta" && n !== "query")
+      .map(n => n.replace(/[`\n\r]/g, ""))
+      .filter(n => n.length > 0 && n.length <= 128)
+    const capped = filtered.slice(0, 50)
+    if (capped.length > 0) {
+      const suffix = filtered.length > 50 ? ` (and ${filtered.length - 50} more)` : ""
+      lines.push(`Available variables in \`__vars\`: ${capped.map(n => `\`${n}\``).join(", ")}${suffix}`)
+    }
+  }
   lines.push("Note: variable references are resolved through tool calls; text-only fallback parsing does not resolve textual SUBMIT snippets.")
   lines.push(`SUBMIT invocation schema for this run: ${JSON.stringify(submitInvocationSchema)}`)
   lines.push("")
